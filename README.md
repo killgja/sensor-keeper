@@ -88,7 +88,32 @@ Add `--dry-run` to `check`, `topup` or `run` to see what it would do without req
 | Channel | How |
 |---|---|
 | Discord | Channel settings → Integrations → Webhooks → New webhook → copy URL |
-| Phone push | Install the free **ntfy** app (iOS/Android), subscribe to a hard-to-guess topic name (anyone who knows it can read your alerts), and give setup the same name |
+| Phone push | Install the free **ntfy** app by Philipp Heckel ([iPhone](https://apps.apple.com/us/app/ntfy/id1625396347) · [Android](https://play.google.com/store/apps/details?id=io.heckel.ntfy)) — white bell on a teal icon. **Not** "Ntfy me" or "Ntfy me - Next Gen"; those are unrelated apps that won't receive these alerts. Tap **+**, subscribe to a hard-to-guess topic name on the default ntfy.sh server (anyone who knows the name can read your alerts), and give setup the same name. Then run `sensor-keeper test-alert`. |
+
+### Phone push alerts with ntfy (step by step)
+
+[ntfy](https://ntfy.sh) is a free notification relay: Sensor Keeper posts a short message to a
+*topic* on ntfy.sh, and every phone subscribed to that topic gets it as a normal notification.
+No account or sign-up is needed.
+
+1. **Install the right app** — **ntfy** by Philipp Heckel (white bell on a teal icon):
+   [iPhone / iPad](https://apps.apple.com/us/app/ntfy/id1625396347) ·
+   [Android (Google Play)](https://play.google.com/store/apps/details?id=io.heckel.ntfy) ·
+   [Android (F-Droid)](https://f-droid.org/packages/io.heckel.ntfy/).
+   ⚠️ **Not** "Ntfy me" or "Ntfy me - Next Gen" — those are unrelated apps and won't receive these alerts.
+2. **Pick a topic name.** It works like a password: anyone who knows it can read (or send to) your
+   alerts, so make it unique and hard to guess, e.g. `sk-yourname-7q4m2x`. Letters, numbers, `-` and `_` only.
+   Don't use a generic name like `4dsky` — other operators might pick the same one.
+3. **Subscribe on your phone.** Open ntfy → tap **+** → enter your topic name exactly (it's case-sensitive) →
+   leave "Use another server" **off** (the default `ntfy.sh`) → **Subscribe**.
+4. **Allow notifications** when your phone asks (iPhone: Settings → Notifications → ntfy → Allow).
+5. **Tell Sensor Keeper the topic.** Run `sensor-keeper setup`, press Enter to keep your other answers,
+   answer **y** to "Use ntfy for phone push alerts?", and type the same topic name.
+6. **Test it:** `sensor-keeper test-alert` — a "Sensor Keeper test" notification should arrive within seconds.
+
+To change topics later, subscribe to the new name in the app, run `sensor-keeper setup` with the new
+name, then remove the old subscription. Alerts go to every phone subscribed to the topic, so family
+members can subscribe too.
 
 You'll get an alert when a sensor stops sending heartbeats, a top-up fails, your token is
 rejected, a sensor is nearly out of HBAR, the Air!Squitter status page shows a problem or goes

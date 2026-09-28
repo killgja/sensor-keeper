@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.0.1';
+const VERSION = '1.0.3';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -505,8 +505,10 @@ Step 4 — alerts (optional, but recommended)
   You'll only hear from it when something needs attention (plus an optional
   weekly all-good summary). Choose any combination, or none.
   • Discord: paste a channel webhook URL (Channel settings → Integrations → Webhooks).
-  • Phone push: install the free "ntfy" app, subscribe to a hard-to-guess topic
-    name (anyone who knows it can read your alerts), and enter the same name here.
+  • Phone push: install the free "ntfy" app by Philipp Heckel (white bell on teal;
+    NOT "Ntfy me" / "Ntfy me - Next Gen", which won't receive these alerts).
+    Tap +, subscribe to a hard-to-guess topic name on the default ntfy.sh server
+    (anyone who knows it can read your alerts), and enter the same name here.
 `);
   cfg.alerts.discordWebhook = await ask(rl, '  Discord webhook URL (Enter to skip)', old.alerts.discordWebhook || '');
   const suggested = old.alerts.ntfyTopic || `sensor-keeper-${Math.random().toString(36).slice(2, 10)}`;
