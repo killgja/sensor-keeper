@@ -12,7 +12,7 @@ Sensor Keeper runs quietly on any always-on computer (Mac, Windows, Linux, Raspb
 - checks each sensor's balance and heartbeats every 30 minutes (Hedera's public mirror node, read-only),
 - tops the sensor up through **Hedera's official Faucet API** when it runs low,
 - optionally checks a Jetvision Air!Squitter's status page on your network,
-- alerts you (Discord, phone push, or email) **only** when something needs attention,
+- alerts you (Discord or phone push) **only** when something needs attention,
 - sends an optional weekly "all good" summary.
 
 No Claude, no AI, no accounts with us. Nothing costs money — testnet HBAR is free and has no value.
@@ -30,8 +30,10 @@ Portal account.
 2. Open your account settings and create a **Personal Access Token**.
 3. Keep it handy — setup will ask for it. It's stored only on your computer.
 
-You'll also need your **sensor's Hedera account ID** (looks like `0.0.1234567`). It's shown
-in the 4DSKY app and in your sensor's Neuron setup.
+You'll also need your **sensor's own Hedera device account ID** (looks like `0.0.1234567`) — the
+account that pays for the sensor's heartbeats, not your wallet or rewards account. It's shown in
+the 4DSKY app and in your sensor's Neuron setup; on hashscan.io it's the account with a steady
+stream of "consensus submit message" transactions.
 
 ## Install
 
@@ -86,8 +88,7 @@ Add `--dry-run` to `check`, `topup` or `run` to see what it would do without req
 | Channel | How |
 |---|---|
 | Discord | Channel settings → Integrations → Webhooks → New webhook → copy URL |
-| Phone push | Install the free **ntfy** app (iOS/Android), subscribe to a hard-to-guess topic name, and give setup the same name |
-| Email | Enter an email address with the ntfy option; ntfy forwards alerts to it |
+| Phone push | Install the free **ntfy** app (iOS/Android), subscribe to a hard-to-guess topic name (anyone who knows it can read your alerts), and give setup the same name |
 
 You'll get an alert when a sensor stops sending heartbeats, a top-up fails, your token is
 rejected, a sensor is nearly out of HBAR, the Air!Squitter status page shows a problem or goes

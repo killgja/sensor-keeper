@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -187,7 +187,6 @@ async function sendAlert(cfg, title, body, priority = 'default') {
   if (a.ntfyTopic) {
     try {
       const headers = { Title: title.replace(/[^\x20-\x7E]/g, ''), Priority: priority, Tags: 'satellite' };
-      if (a.ntfyEmail) headers.Email = a.ntfyEmail;
       const r = await http(`${(a.ntfyServer || 'https://ntfy.sh').replace(/\/+$/, '')}/${encodeURIComponent(a.ntfyTopic)}`, { method: 'POST', headers, body });
       if (r.ok) sent.push('ntfy'); else log(`alert: ntfy returned HTTP ${r.status}`);
     } catch (e) { log(`alert: ntfy failed: ${e.message}`); }
@@ -301,7 +300,7 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
         if (e.status === 401 || e.status === 403) {
           state.tokenBadUntil = now() + 6 * 3600 * 1000;   // don't hammer the faucet with a bad token
           await problem(cfg, state, 'token', true, 'Sensor Keeper: Hedera Portal token rejected',
-            `The faucet refused your access token (${e.status}). Create a new Personal Access Token at portal.hedera.com and run "${APP} setup".`);
+            `The faucet refused your access token (${e.status}: ${e.message.replace(/^faucet HTTP \d+: /, '')}). Create a Personal Access Token in your portal.hedera.com account settings and run "${APP} setup".`);
         } else if (e.status === 429) {
           st.lastTopup = now() - DAY + 3 * 3600 * 1000;  // retry in ~3 h
           out.topup = 'faucet daily limit reached — will retry later';
@@ -447,6 +446,11 @@ Nothing here uses real money: testnet HBAR is free and has no value.
       if (b.missing) { console.log('not found. Double-check the ID (it must be a TESTNET account).'); continue; }
       const hb = await getHeartbeats(id).catch(() => ({}));
       console.log(`found — balance ${fmt(b.balance)} HBAR${hb.lastAgeMin != null ? `, last heartbeat ${fmt(hb.lastAgeMin, 1)} min ago` : ', no heartbeats yet'}.`);
+      if (hb.lastAgeMin == null || hb.lastAgeMin > 60) {
+        console.log('  ⚠ This account isn\'t sending heartbeats. Make sure it is the SENSOR\'s own device account');
+        console.log('    (the one that pays for its heartbeats), not your wallet or rewards account.');
+        if (!(await askYesNo(rl, '  Use it anyway?', false))) continue;
+      }
     } catch (e) { console.log(`couldn't reach the mirror node (${e.message}); saving anyway.`); }
     const name = await ask(rl, '  A nickname for it (optional)', prev ? prev.name || '' : '');
     let statusUrl = '';
@@ -477,6 +481,8 @@ Step 2 — Hedera Portal access token (this is what pays for top-ups, for free)
   for (;;) {
     const t = await askSecret(rl, '  Access token', !!old.portalToken);
     if (!t && old.portalToken) { cfg.portalToken = old.portalToken; break; }
+    if (/^0x[0-9a-fA-F]{40}$/.test(t) || isAccountId(t)) { console.log('  That is an account address, not an access token. Create a Personal Access Token in your portal.hedera.com account settings and paste that.'); continue; }
+    if (/^(0x)?[0-9a-fA-F]{64}$/.test(t) || /^30[0-9a-fA-F]{60,}$/.test(t)) { console.log('  That looks like a PRIVATE KEY — never share it. Sensor Keeper only needs a Portal Personal Access Token.'); continue; }
     if (t.length < 16) { console.log('  That looks too short for a token. Try again.'); continue; }
     cfg.portalToken = t;
     const st0 = loadState(); st0.tokenBadUntil = 0; saveState(st0);
@@ -500,16 +506,20 @@ Step 4 — alerts (optional, but recommended)
   weekly all-good summary). Choose any combination, or none.
   • Discord: paste a channel webhook URL (Channel settings → Integrations → Webhooks).
   • Phone push: install the free "ntfy" app, subscribe to a hard-to-guess topic
-    name, and enter the same topic name here.
-  • Email: ntfy can also email you — enter your address.
+    name (anyone who knows it can read your alerts), and enter the same name here.
 `);
   cfg.alerts.discordWebhook = await ask(rl, '  Discord webhook URL (Enter to skip)', old.alerts.discordWebhook || '');
   const suggested = old.alerts.ntfyTopic || `sensor-keeper-${Math.random().toString(36).slice(2, 10)}`;
-  const useNtfy = await askYesNo(rl, '  Use ntfy for phone push / email?', !!old.alerts.ntfyTopic);
+  const useNtfy = await askYesNo(rl, '  Use ntfy for phone push alerts?', !!old.alerts.ntfyTopic);
   if (useNtfy) {
-    cfg.alerts.ntfyTopic = await ask(rl, '  ntfy topic name', suggested);
-    cfg.alerts.ntfyEmail = await ask(rl, '  Also email alerts to (Enter to skip)', old.alerts.ntfyEmail || '');
-  } else { cfg.alerts.ntfyTopic = ''; cfg.alerts.ntfyEmail = ''; }
+    for (;;) {
+      cfg.alerts.ntfyTopic = await ask(rl, '  ntfy topic name (letters, numbers, - or _)', suggested);
+      if (/^[A-Za-z0-9_-]{1,64}$/.test(cfg.alerts.ntfyTopic)) break;
+      console.log('  Only letters, numbers, - and _ are allowed.');
+    }
+    if (cfg.alerts.ntfyTopic.length < 12) console.log('  Tip: short topic names are easy to guess; anyone subscribed to it sees your alerts.');
+  } else cfg.alerts.ntfyTopic = '';
+  cfg.alerts.ntfyEmail = '';
   cfg.weeklySummary = await askYesNo(rl, '  Send a weekly all-good summary?', old.weeklySummary !== false);
 
   writePrivate(CONFIG, cfg);

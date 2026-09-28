@@ -48,15 +48,19 @@ for d in /usr/local/bin "$HOME/.local/bin"; do
 done
 if [ -z "$LINKDIR" ]; then LINKDIR="$HOME/.local/bin"; mkdir -p "$LINKDIR"; fi
 ln -sf "$TARGET" "$LINKDIR/sensor-keeper"
-case ":$PATH:" in *":$LINKDIR:"*) ;; *)
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
-    [ -f "$rc" ] || [ "$rc" = "$HOME/.zshrc" -a "$os" = Darwin ] || continue
-    grep -q 'sensor-keeper PATH' "$rc" 2>/dev/null || printf '\nexport PATH="%s:$PATH"  # sensor-keeper PATH\n' "$LINKDIR" >> "$rc"
-  done
-  export PATH="$LINKDIR:$PATH" ;;
-esac
+# Make sure new terminal windows can find it (checks the shell startup files,
+# not just this session's PATH, which may differ from the user's own shell).
+for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  if [ -f "$rc" ] || { [ "$rc" = "$HOME/.zshrc" ] && [ "$os" = Darwin ]; }; then
+    if [ "$LINKDIR" != /usr/local/bin ] && ! grep -q 'sensor-keeper PATH' "$rc" 2>/dev/null; then
+      printf '\nexport PATH="%s:$PATH"  # sensor-keeper PATH\n' "$LINKDIR" >> "$rc"
+    fi
+  fi
+done
+export PATH="$LINKDIR:$PATH"
 
 say "Installed: $TARGET"
+echo "(Open a new Terminal window to use the \"sensor-keeper\" command.)"
 echo
 # Run setup interactively even when this script was piped from curl.
 if [ -t 0 ]; then "$TARGET" setup
