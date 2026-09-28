@@ -1,0 +1,33 @@
+# Builds standalone programs for every platform and publishes a GitHub Release
+# whenever a version tag is pushed, e.g.:  git tag v1.0.0 && git push --tags
+# (or create the release/tag on github.com — this runs either way).
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Check syntax
+        run: node --check keeper.js
+      - name: Compile standalone programs
+        run: |
+          mkdir -p dist
+          for t in linux-x64 linux-arm64 darwin-x64 darwin-arm64 windows-x64; do
+            ext=""; [ "$t" = windows-x64 ] && ext=".exe"
+            bun build keeper.js --compile --minify --target=bun-$t --outfile dist/sensor-keeper-$t$ext
+          done
+          cp keeper.js install.sh install.ps1 dist/
+          (cd click-installers && zip -q "../dist/Sensor-Keeper-Mac-installer.zip" "Install Sensor Keeper (Mac).command" \
+             && zip -q "../dist/Sensor-Keeper-Windows-installer.zip" "Install Sensor Keeper (Windows).bat")
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
