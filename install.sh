@@ -2,7 +2,7 @@
 # Sensor Keeper installer for macOS, Linux and Raspberry Pi.
 #   curl -fsSL https://raw.githubusercontent.com/killgja/sensor-keeper/main/install.sh | bash
 # Downloads the standalone program (no Node.js needed), puts it in
-# ~/.sensor-keeper/bin, adds a "sensor-keeper" command, and starts setup.
+# ~/.sensor-keeper/bin, adds a "sensor-keeper" command and an app icon, and opens the app.
 set -euo pipefail
 
 REPO="${SENSOR_KEEPER_REPO:-killgja/sensor-keeper}"
@@ -62,7 +62,18 @@ export PATH="$LINKDIR:$PATH"
 say "Installed: $TARGET"
 echo "(Open a new Terminal window to use the \"sensor-keeper\" command.)"
 echo
-# Run setup interactively even when this script was piped from curl.
-if [ -t 0 ]; then "$TARGET" setup
-elif (: < /dev/tty) 2>/dev/null; then "$TARGET" setup < /dev/tty
-else echo "Now run:  sensor-keeper setup"; fi
+"$TARGET" install-launcher || true
+echo
+if [ "$os" = Darwin ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  # Desktop: open the Sensor Keeper app window in the web browser.
+  nohup "$TARGET" ui >/dev/null 2>&1 &
+  say "Sensor Keeper is opening in your web browser — enter your details there and press Save."
+  if [ "$os" = Darwin ]; then echo "Next time, open it from your Applications folder (Sensor Keeper)."
+  else echo "Next time, open it from your app menu (Sensor Keeper) or run: sensor-keeper ui"; fi
+  echo "Prefer the terminal? Run: sensor-keeper setup"
+else
+  # No desktop (e.g. a headless Raspberry Pi): answer the questions here instead.
+  if [ -t 0 ]; then "$TARGET" setup
+  elif (: < /dev/tty) 2>/dev/null; then "$TARGET" setup < /dev/tty
+  else echo "Now run:  sensor-keeper setup"; fi
+fi

@@ -60,22 +60,42 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/killgja/sensor-keeper/main/install.ps1 | iex
 ```
 
-Either way, setup starts automatically and asks for:
+Either way, the **Sensor Keeper app** opens in your web browser (it runs only on your own
+computer). Fill in the Settings tab and press **Save**:
 
-1. your sensor account ID(s) — it checks each one on Hedera as you go,
-2. your Hedera Portal access token (typed input is hidden),
+1. your sensor account ID(s) — press **Check** to confirm each one on Hedera,
+2. your Hedera Portal access token,
 3. when to top up (default: below 40 HBAR, 60 HBAR at a time),
 4. where to send alerts (optional),
+5. then press **Start background service**.
 
-then offers to run in the background and start at every login.
+On a computer without a screen (e.g. a headless Raspberry Pi) the installer asks the same
+questions in the terminal instead.
+
+![Sensor Keeper app — status and activity](docs/screenshot.png)
 
 ## Everyday use
 
+Open **Sensor Keeper** from your Applications folder (Mac), Start menu or desktop icon (Windows),
+or app menu (Linux) — or run `sensor-keeper ui`. The app shows:
+
+- **Status & activity** — each sensor's balance, days of HBAR left, daily use and health, plus a
+  running log of everything Sensor Keeper has done: top-ups (with Hedera transaction IDs), alerts
+  sent and problems found. "Top up now", "Check now" and "Send test alert" buttons are here too.
+- **Settings** — change any detail and press Save; the background service picks it up within a
+  minute. Start or stop the background service here.
+
+The app window is only reachable from your own computer and closes itself a minute or two after
+you close the browser tab. The background service keeps running either way.
+
+Terminal commands, if you prefer:
+
 ```text
+sensor-keeper ui            open the app window
 sensor-keeper status        balances, days left, last top-up, any problems
 sensor-keeper check         run a check right now
 sensor-keeper topup 0.0.x   request a top-up now
-sensor-keeper setup         change settings (keeps anything you don't change)
+sensor-keeper setup         change settings in the terminal
 sensor-keeper logs          last 40 log lines
 sensor-keeper test-alert    make sure alerts reach you
 sensor-keeper uninstall-service
@@ -107,9 +127,10 @@ No account or sign-up is needed.
 3. **Subscribe on your phone.** Open ntfy → tap **+** → enter your topic name exactly (it's case-sensitive) →
    leave "Use another server" **off** (the default `ntfy.sh`) → **Subscribe**.
 4. **Allow notifications** when your phone asks (iPhone: Settings → Notifications → ntfy → Allow).
-5. **Tell Sensor Keeper the topic.** Run `sensor-keeper setup`, press Enter to keep your other answers,
-   answer **y** to "Use ntfy for phone push alerts?", and type the same topic name.
-6. **Test it:** `sensor-keeper test-alert` — a "Sensor Keeper test" notification should arrive within seconds.
+5. **Tell Sensor Keeper the topic.** In the app's Settings tab, type the same name in "Phone push — ntfy topic"
+   and press Save (or in the terminal: `sensor-keeper setup`).
+6. **Test it:** press **Send test alert** on the app's Status tab (or run `sensor-keeper test-alert`) — a
+   "Sensor Keeper test" notification should arrive within seconds.
 
 To change topics later, subscribe to the new name in the app, run `sensor-keeper setup` with the new
 name, then remove the old subscription. Alerts go to every phone subscribed to the topic, so family
