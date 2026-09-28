@@ -24,6 +24,7 @@ jobs:
             bun build keeper.js --compile --minify --target=bun-$t --outfile dist/sensor-keeper-$t$ext
           done
           cp keeper.js install.sh install.ps1 dist/
+          chmod +x "click-installers/Install Sensor Keeper (Mac).command" install.sh
           (cd click-installers && zip -q "../dist/Sensor-Keeper-Mac-installer.zip" "Install Sensor Keeper (Mac).command" \
              && zip -q "../dist/Sensor-Keeper-Windows-installer.zip" "Install Sensor Keeper (Windows).bat")
           (cd dist && sha256sum * > SHA256SUMS.txt)
