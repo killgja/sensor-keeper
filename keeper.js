@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -834,6 +834,9 @@ async function runUi() {
   const crypto = require('crypto');
   ensureHome();
   const key = crypto.randomBytes(18).toString('hex');
+  // Standalone builds store the page's special characters (→ — …) as \uXXXX
+  // escapes; turn them back into real characters before serving.
+  const PAGE = UI_HTML.replace(/\\u([0-9a-fA-F]{4})/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
   let lastPing = now();
 
   const send = (res, code, obj) => {
@@ -854,7 +857,7 @@ async function runUi() {
       if (url.searchParams.get('k') !== key) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('Open Sensor Keeper from its app icon or with "sensor-keeper ui".'); }
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY',
         'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:" });
-      return res.end(UI_HTML.replace('__KEY__', key).replace('__VERSION__', VERSION));
+      return res.end(PAGE.replace('__KEY__', key).replace('__VERSION__', VERSION));
     }
     if (!url.pathname.startsWith('/api/')) { res.writeHead(404); return res.end(); }
     if (req.headers['x-sk-key'] !== key) return send(res, 403, { error: 'forbidden' });
@@ -1078,7 +1081,7 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
 
   <div class="card"><h2>2. Hedera Portal access token</h2>
     <p class="help">Top-ups come from Hedera's free, official faucet, which needs your own token. It's stored only on this computer.</p>
-    <ol class="steps"><li>Go to <a href="https://portal.hedera.com" target="_blank" rel="noopener">portal.hedera.com</a> and sign in (free account).</li><li>Open account settings → create a <b>Personal Access Token</b> (starts with <code>v4.public.</code>).</li><li>Paste it below.</li></ol>
+    <ol class="steps"><li>Go to <a href="https://portal.hedera.com" target="_blank" rel="noopener">portal.hedera.com</a> and sign in. If you don't have an account, create one for free.</li><li>Open your account settings and create a new <b>Personal Access Token</b>.</li><li>Copy the token. It is a long code that starts with <code>v4.public.</code></li><li>Paste it in the box below and press Save settings.</li></ol>
     <label for="token">Access token</label><input type="password" id="token" autocomplete="off" spellcheck="false">
     <div class="note" id="tokenNote"></div></div>
 
