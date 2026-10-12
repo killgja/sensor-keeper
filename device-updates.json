@@ -1,0 +1,4 @@
+{
+  "_comment": "Pin an Air!Squitter software version that every Sensor Keeper should install, e.g. a hotfix jetvision does not offer automatically. Set airsquitter to null when nothing is pinned. Sensor Keeper only ever moves a sensor forward, never back.",
+  "airsquitter": null
+}

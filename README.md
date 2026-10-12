@@ -13,7 +13,8 @@ Sensor Keeper runs quietly on any always-on computer (Mac, Windows, Linux, Raspb
 - tops the sensor up through **Hedera's official Faucet API** when it runs low,
 - optionally checks a Jetvision Air!Squitter's status page on your network,
 - alerts you (Discord or phone push) **only** when something needs attention,
-- sends an optional weekly "all good" summary.
+- sends an optional weekly "all good" summary,
+- **keeps itself up to date**, and can **install Air!Squitter software updates** for you.
 
 No Claude, no AI, no accounts with us. Nothing costs money — testnet HBAR is free and has no value.
 
@@ -98,10 +99,34 @@ sensor-keeper topup 0.0.x   request a top-up now
 sensor-keeper setup         change settings in the terminal
 sensor-keeper logs          last 40 log lines
 sensor-keeper test-alert    make sure alerts reach you
+sensor-keeper update        install the latest Sensor Keeper now
+sensor-keeper update-sensors  check for and install Air!Squitter software now
 sensor-keeper uninstall-service
 ```
 
 Add `--dry-run` to `check`, `topup` or `run` to see what it would do without requesting HBAR.
+
+## Automatic updates
+
+Both are on by default; turn them off with the "Install updates automatically" box in Settings
+(or answer "n" in `sensor-keeper setup`).
+
+**Sensor Keeper itself.** Every 6 hours it checks this project's latest GitHub release. If there's
+a newer version it downloads the build for your computer, checks it against the release's
+`SHA256SUMS.txt`, swaps it in and restarts — then tells you on Discord/ntfy. Only the installed
+copy in `~/.sensor-keeper/bin` updates itself.
+
+**Your Air!Squitter's software.** For each sensor with a status page address, Sensor Keeper does
+what you'd do on the sensor's *Settings → Software Maintenance → Software Update* page. It logs in
+with jetvision's factory-default admin password; if you changed yours, enter it in Settings (or
+`sensor-keeper setup`). Every 6 hours it logs in, and if jetvision is offering a newer
+version it presses Update, waits for the sensor to restart, confirms the new version and tells you.
+If an update doesn't finish within an hour it alerts you and retries a day later.
+
+For urgent fixes jetvision doesn't offer automatically, a version can be pinned in
+[`device-updates.json`](device-updates.json); every Sensor Keeper will then install it (forward only,
+never a downgrade). Note: the sensor downloads updates from jetvision itself, so it needs working
+internet access to update.
 
 ## Alerts
 
@@ -164,8 +189,11 @@ enter the new ID.
 - Settings are stored in `~/.sensor-keeper/config.json` (Windows: `%USERPROFILE%\.sensor-keeper`),
   readable only by your user account.
 - **No private keys** are ever requested or stored. The faucet sends HBAR straight to your sensor.
-- The only places it talks to: Hedera's mirror node, Hedera's faucet, your sensor's status page
-  (if you add it), and the alert services you choose.
+- The only places it talks to: Hedera's mirror node, Hedera's faucet, your sensor's web page
+  (if you add it), the alert services you choose, and — for automatic updates — GitHub (this
+  project's releases and `device-updates.json`) and jetvision's public version-history page.
+- The Air!Squitter admin password is only ever sent to your sensor on your own network. If you
+  enter your own (instead of the factory default), it's stored only in `config.json`.
 - It's one readable file: [`keeper.js`](keeper.js). No third-party packages.
 
 ## Uninstall

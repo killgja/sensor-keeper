@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -52,6 +52,8 @@ const DEFAULTS = {
   heartbeatAlertMinutes: 15,
   alerts: { discordWebhook: '', ntfyTopic: '', ntfyServer: 'https://ntfy.sh', ntfyEmail: '' },
   weeklySummary: true,
+  autoUpdate: true,           // keep Sensor Keeper itself up to date from GitHub releases
+  deviceAutoUpdate: true,     // install Air!Squitter software updates (sensors with a status page address)
   dryRun: false,
 };
 
@@ -340,6 +342,258 @@ function describe(r) {
   return `${r.label}: ${fmt(r.balance)} HBAR${days}, ${hb}${dev}${r.topup ? `, top-up: ${r.topup}` : ''}`;
 }
 
+// ---------------------------------------------------------------- self-update
+// Checks GitHub for a newer Sensor Keeper release, verifies the download against
+// the release's SHA256SUMS.txt, swaps it in, and restarts. Only an installed copy
+// (in ~/.sensor-keeper/bin) updates itself, never a copy run from a source folder.
+const REPO = process.env.SENSOR_KEEPER_REPO || 'killgja/sensor-keeper';
+const GITHUB_API = process.env.SENSOR_KEEPER_GITHUB_API || 'https://api.github.com';
+const UPDATE_EVERY = 6 * 3600 * 1000;
+
+function semverGt(a, b) {
+  const p = (v) => String(v).replace(/^v/, '').split(/[.-]/).slice(0, 3).map((x) => parseInt(x, 10) || 0);
+  const [x, y] = [p(a), p(b)];
+  for (let i = 0; i < 3; i++) { if (x[i] !== y[i]) return x[i] > y[i]; }
+  return false;
+}
+
+function selfTarget() {
+  const runningUnderNode = /^node(\.exe)?$/i.test(path.basename(process.execPath));
+  const file = path.resolve(runningUnderNode ? __filename : process.execPath);
+  const asset = runningUnderNode ? 'keeper.js'
+    : ({ 'darwin-arm64': 'sensor-keeper-darwin-arm64', 'darwin-x64': 'sensor-keeper-darwin-x64',
+      'linux-x64': 'sensor-keeper-linux-x64', 'linux-arm64': 'sensor-keeper-linux-arm64',
+      'win32-x64': 'sensor-keeper-windows-x64.exe' })[`${process.platform}-${process.arch}`];
+  const installed = file.startsWith(path.resolve(HOME, 'bin') + path.sep);
+  return { file, asset, installed, runningUnderNode };
+}
+
+async function download(url, timeoutMs = 120000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: ctl.signal, redirect: 'follow', headers: { 'User-Agent': `${APP}/${VERSION}` } });
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return Buffer.from(await res.arrayBuffer());
+  } finally { clearTimeout(t); }
+}
+
+// Returns { updated, version, reason }. Never throws.
+async function selfUpdate(cfg, { force = false } = {}) {
+  const tgt = selfTarget();
+  try {
+    const r = await http(`${GITHUB_API}/repos/${REPO}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok || !r.json || !r.json.tag_name) return { updated: false, reason: `GitHub HTTP ${r.status}` };
+    const latest = r.json.tag_name.replace(/^v/, '');
+    if (!semverGt(latest, VERSION)) return { updated: false, version: latest, reason: 'up to date' };
+    if (!tgt.installed && !force) return { updated: false, version: latest, reason: `v${latest} is available, but this copy isn't the installed one (${tgt.file}); run the installer or "${APP} update --force"` };
+    if (!tgt.asset) return { updated: false, version: latest, reason: `no download for ${process.platform}-${process.arch}` };
+    const assets = r.json.assets || [];
+    const a = assets.find((x) => x.name === tgt.asset);
+    const sums = assets.find((x) => x.name === 'SHA256SUMS.txt');
+    if (!a || !sums) return { updated: false, version: latest, reason: `release v${latest} is missing ${!a ? tgt.asset : 'SHA256SUMS.txt'}` };
+    const [bin, sumText] = [await download(a.browser_download_url), (await download(sums.browser_download_url)).toString('utf8')];
+    const want = (sumText.split('\n').map((l) => l.trim().split(/\s+\*?/)).find((p) => p[1] === tgt.asset) || [])[0];
+    const got = require('crypto').createHash('sha256').update(bin).digest('hex');
+    if (!want || want.toLowerCase() !== got) return { updated: false, version: latest, reason: `checksum mismatch for ${tgt.asset} — not installed` };
+    if (tgt.runningUnderNode) {
+      // quick sanity check: must at least parse
+      const tmpCheck = tgt.file + '.check.js';
+      fs.writeFileSync(tmpCheck, bin);
+      try { execFileSync(process.execPath, ['--check', tmpCheck], { stdio: 'ignore' }); } finally { fs.rmSync(tmpCheck, { force: true }); }
+    }
+    const tmp = tgt.file + '.new';
+    fs.writeFileSync(tmp, bin, { mode: 0o755 });
+    if (process.platform === 'darwin') { try { execFileSync('xattr', ['-d', 'com.apple.quarantine', tmp], { stdio: 'ignore' }); } catch {} }
+    if (process.platform === 'win32') {
+      // Windows can't overwrite a running .exe, but it can rename it.
+      const old = tgt.file + '.old';
+      fs.rmSync(old, { force: true });
+      fs.renameSync(tgt.file, old);
+    }
+    fs.renameSync(tmp, tgt.file);
+    const s = loadState(); s.lastUpdate = { t: now(), from: VERSION, to: latest }; saveState(s);
+    log(`self-update: installed Sensor Keeper v${latest} (was v${VERSION})`);
+    if (cfg) await sendAlert(cfg, `Sensor Keeper updated to v${latest}`, `Installed automatically (was v${VERSION}).${r.json.html_url ? `\nWhat's new: ${r.json.html_url}` : ''}`, 'low');
+    return { updated: true, version: latest };
+  } catch (e) {
+    return { updated: false, reason: e.message };
+  }
+}
+
+// Restart into the new version. launchd (KeepAlive) and systemd (Restart=always)
+// restart us themselves; otherwise start a fresh copy before exiting.
+function restartSelf() {
+  let managed = process.env.SENSOR_KEEPER_SERVICE === '1' || /com\.sensorkeeper/.test(process.env.XPC_SERVICE_NAME || '');
+  if (!managed && process.platform === 'linux') {
+    try { managed = fs.readFileSync('/proc/self/cgroup', 'utf8').includes(`${APP}.service`); } catch {}
+  }
+  try { if (readJson(LOCK, null) == process.pid) fs.unlinkSync(LOCK); } catch {}
+  if (!managed) {
+    const tgt = selfTarget();
+    const [cmd, args] = tgt.runningUnderNode ? [process.execPath, [tgt.file, 'run']] : [tgt.file, ['run']];
+    spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  }
+  log('restarting into the new version');
+  setTimeout(() => process.exit(0), 500);
+}
+
+// ---------------------------------------------------------------- Air!Squitter software updates
+// Uses the sensor's own "Software Maintenance → Software Update" page, exactly as
+// you would by hand: log in, see which version jetvision offers, press Update.
+// It installs (a) what the sensor itself offers, or (b) a hotfix pinned in this
+// project's device-updates.json (for releases jetvision doesn't offer automatically).
+// jetvision's public version history is checked for information only.
+// Logs in with the factory-default admin password unless you saved your own
+// (saved only in config.json).
+const JV_HISTORY = process.env.SENSOR_KEEPER_JV_HISTORY || 'https://wiki.jetvision.de/wiki/Radarcape:Version_History';
+const DEVICE_MANIFEST = process.env.SENSOR_KEEPER_DEVICE_MANIFEST || `https://raw.githubusercontent.com/${REPO}/main/device-updates.json`;
+const DEVICE_UPDATE_EVERY = 6 * 3600 * 1000;
+const DEVICE_UPDATE_TIMEOUT = 60 * 60 * 1000;
+const JV_VER = /\b(\d{6}\.\d{4}\.\d{2})\b/g;
+// jetvision's published factory-default admin password. Used unless you save your own.
+const JETVISION_DEFAULT_PASSWORD = 'radarcape';
+const devicePw = (sensor) => sensor.devicePassword || JETVISION_DEFAULT_PASSWORD;
+
+const jvCmp = (a, b) => String(a).localeCompare(String(b), 'en', { numeric: true });
+const devBase = (u) => u.replace(/\/+$/, '');
+
+async function deviceVersion(statusUrl) {
+  const r = await http(`${devBase(statusUrl)}/param.json?param=versioninfo,productname`, {}, 8000);
+  if (!r.ok || !r.json) throw new Error(`HTTP ${r.status}`);
+  const m = String(r.json.versioninfo || '').match(/\d{6}\.\d{4}\.\d{2}/);
+  return { version: m ? m[0] : null, product: r.json.productname || '' };
+}
+
+async function deviceLogin(statusUrl, password) {
+  const r = await fetch(`${devBase(statusUrl)}/login_post.html`, {
+    method: 'POST', redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': `${APP}/${VERSION}` },
+    body: new URLSearchParams({ usr: 'Administrator', pwd: password, plf: 'maintenance.html' }).toString(),
+    signal: AbortSignal.timeout(15000),
+  });
+  const cookies = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [r.headers.get('set-cookie') || ''];
+  const sid = cookies.map((c) => (c.match(/(?:^|,\s*)SID=([^;,\s]+)/) || [])[1]).find(Boolean);
+  if (!sid) throw Object.assign(new Error('the sensor rejected the admin password'), { badPassword: true });
+  return `SID=${sid}`;
+}
+
+async function deviceMaintenance(statusUrl, cookie) {
+  const r = await http(`${devBase(statusUrl)}/maintenance.html`, { headers: { Cookie: cookie } }, 15000);
+  const html = r.text || '';
+  if (!/radarcapedform/.test(html)) throw new Error('could not open the Software Maintenance page');
+  const cur = (html.match(/Current software version is\s*(\d{6}\.\d{4}\.\d{2})/) || [])[1] || null;
+  const input = (html.match(/<input[^>]*id="radarcapedlink"[^>]*>/) || [''])[0];
+  const offered = ((input.match(/value="([^"]*)"/) || [])[1] || '').trim();
+  return { current: cur, offered: /^\d{6}\.\d{4}\.\d{2}$/.test(offered) ? offered : null };
+}
+
+async function latestPublished() {
+  const out = { history: null, pinned: null, minimum: null };
+  try {
+    const r = await http(JV_HISTORY, {}, 20000);
+    if (r.ok) {
+      // Skip versions the history marks as withdrawn.
+      const text = r.text.replace(/<[^>]+>/g, ' ');
+      const found = [...text.matchAll(JV_VER)].map((m) => ({ v: m[1], after: text.slice(m.index + m[0].length, m.index + m[0].length + 40) }))
+        .filter((x) => !/^\s*\(?\s*withdrawn/i.test(x.after)).map((x) => x.v);
+      if (found.length) out.history = found.sort(jvCmp).pop();
+    }
+  } catch { /* offline: fine */ }
+  try {
+    const r = await http(DEVICE_MANIFEST, {}, 15000);
+    const a = r.ok && r.json && r.json.airsquitter;
+    if (a && /^\d{6}\.\d{4}\.\d{2}$/.test(a.version || '')) out.pinned = { version: a.version, note: a.note || '' };
+  } catch { /* fine */ }
+  return out;
+}
+
+// Called from the run loop for each Air!Squitter with a saved admin password.
+async function deviceAutoUpdate(cfg, state, sensor, { force = false } = {}) {
+  const id = sensor.id;
+  const label = sensor.name ? `${sensor.name} (${id})` : id;
+  const st = (state.sensors[id] = state.sensors[id] || {});
+  const du = (st.deviceUpdate = st.deviceUpdate || {});
+
+  // 1. An update is in progress: wait for the sensor to come back on the new version.
+  if (du.pending) {
+    let v = null;
+    try { v = (await deviceVersion(sensor.statusUrl)).version; } catch { /* rebooting */ }
+    if (v && jvCmp(v, du.pending.to) >= 0) {
+      log(`${label}: software updated ${du.pending.from} → ${v}`);
+      await sendAlert(cfg, `Sensor Keeper: ${label} software updated`, `Air!Squitter software ${du.pending.from} → ${v}. It's back online.`, 'low');
+      du.last = { t: now(), version: v, ok: true }; du.current = v; du.lastResult = `updated to ${v}`; delete du.pending;
+    } else if (now() - du.pending.t > DEVICE_UPDATE_TIMEOUT) {
+      const why = v ? `it is still on ${v} — it probably couldn't download the update (check its internet/DNS)` : "it hasn't come back online";
+      log(`${label}: software update to ${du.pending.to} did not finish: ${why}`);
+      await sendAlert(cfg, `Sensor Keeper: ${label} software update didn't finish`, `Tried to install ${du.pending.to}, but ${why}. I'll try again in a day.`, 'high');
+      du.last = { t: now(), version: v, ok: false, target: du.pending.to }; du.retryAfter = now() + DAY; delete du.pending;
+    }
+    return;
+  }
+  if (!force && du.retryAfter && now() < du.retryAfter) return;
+  if (!force && du.lastCheck && now() - du.lastCheck < DEVICE_UPDATE_EVERY) return;
+  du.lastCheck = now();
+
+  // 2. Find the newest version and compare.
+  let cookie, info;
+  try {
+    cookie = await deviceLogin(sensor.statusUrl, devicePw(sensor));
+    info = await deviceMaintenance(sensor.statusUrl, cookie);
+    await problem(cfg, st, 'device-login', false, `Sensor Keeper: can't log in to ${label}`, '');
+  } catch (e) {
+    log(`${label}: software update check failed: ${e.message}`);
+    if (e.badPassword) await problem(cfg, st, 'device-login', true, `Sensor Keeper: can't log in to ${label}`,
+      `Automatic software updates are paused: ${e.message}${sensor.devicePassword ? ' (your saved password)' : ' (the factory-default password)'}. ` +
+      `If you changed the sensor's admin password, enter it in Sensor Keeper's Settings.`);
+    return;
+  }
+  const pub = await latestPublished();
+  // Install only what the sensor itself offers, or a hotfix pinned in device-updates.json.
+  // jetvision's public version history is only reported, never installed on its own.
+  const candidates = [info.offered, pub.pinned && pub.pinned.version].filter(Boolean);
+  du.current = info.current;
+  du.published = pub.history;
+  if (!info.current || !candidates.length) {
+    du.lastResult = `on ${info.current || '?'}; the sensor isn't offering an update` +
+      (pub.history && info.current && jvCmp(pub.history, info.current) > 0 ? ` (jetvision lists ${pub.history} — the sensor may not be able to reach jetvision)` : '');
+    return;
+  }
+  const target = candidates.sort(jvCmp).pop();
+  du.latest = target;
+  if (jvCmp(target, info.current) <= 0) { du.lastResult = `up to date (${info.current})`; return; }
+  if (du.last && !du.last.ok && du.last.target === target && !force && now() < (du.retryAfter || 0)) return;
+  if (cfg.dryRun) { log(`[dry-run] ${label}: would update Air!Squitter software ${info.current} → ${target}`); return; }
+
+  // 3. Install: same as pressing "Update Software" on the Software Maintenance page.
+  const r = await http(`${devBase(sensor.statusUrl)}/maintenance_radarcape_post.html`, {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ link: target }).toString(),
+  }, 60000).catch((e) => ({ ok: false, status: e.message }));
+  if (!r.ok) {
+    log(`${label}: software update request failed (${r.status})`);
+    du.retryAfter = now() + DAY;
+    await sendAlert(cfg, `Sensor Keeper: ${label} software update failed`, `The sensor refused the update to ${target} (${r.status}). I'll try again in a day.`, 'high');
+    return;
+  }
+  du.pending = { t: now(), from: info.current, to: target };
+  const why = pub.pinned && pub.pinned.version === target && pub.pinned.note ? `\n${pub.pinned.note}` : '';
+  log(`${label}: installing Air!Squitter software ${info.current} → ${target}`);
+  await sendAlert(cfg, `Sensor Keeper: updating ${label}`, `Installing Air!Squitter software ${target} (was ${info.current}). The sensor restarts and is offline for a few minutes.${why}`, 'default');
+}
+
+async function deviceUpdatesAll(cfg, opts = {}) {
+  if (cfg.deviceAutoUpdate === false && !opts.force) return;
+  const targets = cfg.sensors.filter((s) => s.statusUrl);
+  if (!targets.length) return;
+  const state = loadState();
+  for (const s of targets) {
+    try { await deviceAutoUpdate(cfg, state, s, opts); }
+    catch (e) { log(`${s.id}: software update error: ${e.message}`); }
+  }
+  saveState(state);
+}
+
 // ---------------------------------------------------------------- run loop
 function acquireLock() {
   ensureHome();
@@ -360,10 +614,23 @@ async function runLoop() {
   if (!acquireLock()) { log('another Sensor Keeper is already running — exiting'); process.exit(0); }
   log(`Sensor Keeper ${VERSION} started, watching ${cfg.sensors.map((s) => s.id).join(', ')}${cfg.dryRun ? ' [dry-run]' : ''}`);
   let lastCheck = 0;
+  let lastUpdateTry = 0;
+  const selfFile = selfTarget().file;
+  const mtime = () => { try { return fs.statSync(selfFile).mtimeMs; } catch { return 0; } };
+  const startMtime = mtime();
   // Wake every minute and decide by wall-clock time, so a sleeping or throttled
   // computer simply catches up when it wakes.
   for (;;) {
     cfg = loadConfig() || cfg;   // pick up edits without a restart
+    // A newer copy was installed (by "update", the installer, or the app): restart into it.
+    if (startMtime && mtime() && mtime() !== startMtime) { log('a new Sensor Keeper version was installed'); restartSelf(); return; }
+    if (cfg.autoUpdate !== false && now() - lastUpdateTry >= UPDATE_EVERY && now() - (loadState().lastUpdateCheck || 0) >= UPDATE_EVERY) {
+      lastUpdateTry = now();
+      const u = await selfUpdate(cfg);
+      const s = loadState(); s.lastUpdateCheck = now(); saveState(s);
+      if (u.updated) { restartSelf(); return; }
+      if (u.reason && u.reason !== 'up to date') log(`self-update: ${u.reason}`);
+    }
     if (now() - lastCheck >= cfg.checkEveryMinutes * 60000) {
       lastCheck = now();
       try {
@@ -375,6 +642,7 @@ async function runLoop() {
           state.lastSummary = now();
           saveState(state);
         }
+        await deviceUpdatesAll(cfg);
       } catch (e) { log(`check failed: ${e.stack || e.message}`); }
     }
     await sleep(60000);
@@ -466,7 +734,25 @@ Nothing here uses real money: testnet HBAR is free and has no value.
         catch (e) { console.log(`not reachable right now (${e.message}); saving anyway.`); }
       }
     }
-    sensors.push({ id, ...(name ? { name } : {}), ...(statusUrl ? { statusUrl } : {}) });
+    let devicePassword = '';
+    if (statusUrl) {
+      console.log('  Sensor Keeper also installs Air!Squitter software updates for you (it does what');
+      console.log('  you would do on the sensor\'s Software Maintenance page), logging in with the');
+      console.log('  sensor\'s admin password. Most sensors still use the factory default; if you changed');
+      console.log('  yours, enter it here. It\'s saved only on this computer.');
+      for (;;) {
+        const keep = prev && prev.devicePassword;
+        const typed = await askSecret(rl, keep ? '  Air!Squitter admin password' : '  Air!Squitter admin password [press Enter for the factory default]', !!keep);
+        devicePassword = typed || (keep ? prev.devicePassword : '');
+        process.stdout.write('  Checking… ');
+        try { await deviceLogin(statusUrl, devicePassword || JETVISION_DEFAULT_PASSWORD); console.log('password works.'); break; }
+        catch (e) {
+          if (e.badPassword) { console.log(`the sensor rejected ${devicePassword ? 'that password' : 'the factory default'}. Enter the password you use for its web page.`); continue; }
+          console.log(`couldn't reach the sensor (${e.message}); saving anyway.`); break;
+        }
+      }
+    }
+    sensors.push({ id, ...(name ? { name } : {}), ...(statusUrl ? { statusUrl } : {}), ...(devicePassword ? { devicePassword } : {}) });
     i++;
     console.log('');
   }
@@ -526,6 +812,8 @@ Step 4 — alerts (optional, but recommended)
   } else cfg.alerts.ntfyTopic = '';
   cfg.alerts.ntfyEmail = '';
   cfg.weeklySummary = await askYesNo(rl, '  Send a weekly all-good summary?', old.weeklySummary !== false);
+  cfg.autoUpdate = await askYesNo(rl, '\nInstall updates automatically (Sensor Keeper itself, and Air!Squitter software)?', old.autoUpdate !== false);
+  cfg.deviceAutoUpdate = cfg.autoUpdate;
 
   writePrivate(CONFIG, cfg);
   console.log(`\nSaved to ${CONFIG}\n`);
@@ -605,7 +893,7 @@ function installMacDaemon(cmd, args) {
 <plist version="1.0"><dict>
   <key>Label</key><string>${label}</string>
   <key>UserName</key><string>${esc(os.userInfo().username)}</string>
-  <key>EnvironmentVariables</key><dict><key>HOME</key><string>${esc(os.homedir())}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>HOME</key><string>${esc(os.homedir())}</string><key>SENSOR_KEEPER_SERVICE</key><string>1</string></dict>
   <key>ProgramArguments</key><array>${[cmd, ...args].map((a) => `<string>${esc(a)}</string>`).join('')}</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -640,6 +928,7 @@ function installService(always = false) {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>${label}</string>
+  <key>EnvironmentVariables</key><dict><key>SENSOR_KEEPER_SERVICE</key><string>1</string></dict>
   <key>ProgramArguments</key><array>${[cmd, ...args].map((a) => `<string>${esc(a)}</string>`).join('')}</array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -663,6 +952,7 @@ After=network-online.target
 
 [Service]
 ExecStart=${[cmd, ...args].map(q).join(' ')}
+Environment=SENSOR_KEEPER_SERVICE=1
 Restart=always
 RestartSec=30
 
@@ -808,6 +1098,7 @@ function publicConfig(cfg) {
   const c = JSON.parse(JSON.stringify(cfg || DEFAULTS));
   const t = c.portalToken || '';
   delete c.portalToken;
+  c.sensors = (c.sensors || []).map(({ devicePassword, ...s }) => ({ ...s, devicePasswordSet: !!devicePassword }));
   c.tokenSet = !!t;
   c.tokenHint = t ? '…' + t.slice(-4) : '';
   return c;
@@ -870,7 +1161,10 @@ async function runUi() {
         const st = loadState();
         const sensors = (cfg ? cfg.sensors : []).map((s) => {
           const x = st.sensors[s.id] || {};
-          return { ...s, balance: x.lastBalance ?? null, burnPerDay: x.burnPerDay ?? null, lastCheck: x.lastCheck || null,
+          const { devicePassword, ...pub } = s;
+          const du = x.deviceUpdate || {};
+          return { ...pub, devicePasswordSet: !!devicePassword, software: du.current || null, softwareLatest: du.latest || null,
+            softwareUpdating: du.pending ? du.pending.to : null, balance: x.lastBalance ?? null, burnPerDay: x.burnPerDay ?? null, lastCheck: x.lastCheck || null,
             lastTopup: x.lastTopup || null, problems: Object.keys(x.problems || {}) };
         });
         return send(res, 200, {
@@ -905,7 +1199,9 @@ async function runUi() {
           if (!isAccountId(id)) return send(res, 400, { error: `"${id}" isn't a Hedera account ID (0.0.12345).` });
           let statusUrl = String(s.statusUrl || '').trim();
           if (statusUrl && !/^https?:\/\//.test(statusUrl)) statusUrl = 'http://' + statusUrl;
-          sensors.push({ id, ...(s.name ? { name: String(s.name).trim().slice(0, 60) } : {}), ...(statusUrl ? { statusUrl } : {}) });
+          const prevS = ((cfg && cfg.sensors) || []).find((x) => x.id === id) || {};
+          const pw = s.clearPassword ? '' : (String(s.devicePassword || '') || prevS.devicePassword || '');
+          sensors.push({ id, ...(s.name ? { name: String(s.name).trim().slice(0, 60) } : {}), ...(statusUrl ? { statusUrl } : {}), ...(statusUrl && pw ? { devicePassword: pw } : {}) });
         }
         if (!sensors.length) return send(res, 400, { error: 'Add at least one sensor account ID.' });
         next.sensors = sensors;
@@ -927,6 +1223,7 @@ async function runUi() {
         if (hook && !/^https:\/\/(discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)\/api\/webhooks\//.test(hook)) return send(res, 400, { error: "That doesn't look like a Discord webhook URL." });
         next.alerts = { ...next.alerts, discordWebhook: hook, ntfyTopic: topic, ntfyEmail: '' };
         next.weeklySummary = !!b.weeklySummary;
+        if (typeof b.autoUpdate === 'boolean') { next.autoUpdate = b.autoUpdate; next.deviceAutoUpdate = b.autoUpdate; }
         writePrivate(CONFIG, next);
         log('settings saved from the app');
         return send(res, 200, { ok: true, config: publicConfig(next) });
@@ -1032,7 +1329,7 @@ nav.tabs button.on{color:var(--ink);border-color:var(--accent);font-weight:600}
 label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
 input[type=text],input[type=password],input[type=number],input[type=url]{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
 input:focus{outline:2px solid var(--accent);outline-offset:0}
-.row{display:grid;grid-template-columns:1.1fr 1fr 1.2fr auto;gap:10px;align-items:end}
+.row{display:grid;grid-template-columns:1.1fr 1fr 1.2fr 1fr auto;gap:10px;align-items:end}
 .row3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 @media (max-width:720px){.row,.row3{grid-template-columns:1fr}}
 button.btn{border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px 14px;border-radius:8px;font:inherit;cursor:pointer;white-space:nowrap}
@@ -1101,7 +1398,8 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
       <li>In the app tap <b>+</b>, type the exact topic name above (capitals matter), keep the default ntfy.sh server, Subscribe, and allow notifications.</li>
       <li>Save, then press "Send test alert" on the Status tab.</li></ol>
     <div class="warnbox">The topic name works like a password — anyone who knows it can read your alerts. Use something unique.</div>
-    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:14px"><input type="checkbox" id="weekly"> Send a weekly "all good" summary</label></div>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:14px"><input type="checkbox" id="weekly"> Send a weekly "all good" summary</label>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="autoupd"> Install updates automatically (Sensor Keeper itself, and Air!Squitter software)</label></div>
 
   <div class="card"><h2>5. Run in the background</h2>
     <p class="help" id="svcHelp">Sensor Keeper keeps watch in the background and starts automatically.</p>
@@ -1142,7 +1440,7 @@ function renderStatus(){
   document.querySelectorAll('[data-topup]').forEach(function(b){b.onclick=function(){if(!confirm('Request a top-up for '+b.dataset.topup+' now? It uses part of your daily 100 HBAR faucet allowance.'))return;b.disabled=true;api('topup',{id:b.dataset.topup}).then(function(r){toast(r.result,8000);refresh();}).catch(function(e){toast(e.message,8000);}).then(function(){b.disabled=false;});};});
   var t=S.topups;$('stCount').textContent=t.count;$('stTotal').textContent=t.total.toLocaleString();$('stLast').textContent=t.last?local(t.last):'never';$('stFaucet').textContent=S.faucetUsed+' / '+S.faucetLimit;}
 function sensorRow(s){var d=document.createElement('div');d.className='sensor';
-  d.innerHTML='<div class="row"><div><label>Account ID</label><input type="text" class="sid" placeholder="0.0.1234567" value="'+esc(s.id)+'"></div><div><label>Nickname (optional)</label><input type="text" class="sname" value="'+esc(s.name)+'"></div><div><label>Jetvision status page on your network (optional)</label><input type="text" class="surl" placeholder="http://192.168.1.50" value="'+esc(s.statusUrl)+'"></div><div class="actions"><button class="btn small chk">Check</button><button class="btn small rm" title="Remove">Remove</button></div></div><div class="note res"></div>';
+  d.innerHTML='<div class="row"><div><label>Account ID</label><input type="text" class="sid" placeholder="0.0.1234567" value="'+esc(s.id)+'"></div><div><label>Nickname (optional)</label><input type="text" class="sname" value="'+esc(s.name)+'"></div><div><label>Jetvision status page on your network (optional)</label><input type="text" class="surl" placeholder="http://192.168.1.50" value="'+esc(s.statusUrl)+'"></div><div><label>Air!Squitter admin password</label><input type="password" class="spw" autocomplete="new-password" placeholder="'+(s.devicePasswordSet?'your saved password — type to change':'factory default — type to change')+'">'+(s.devicePasswordSet?'<label class="note" style="display:flex;gap:6px;align-items:center;margin-top:4px"><input type="checkbox" class="spwreset"> use factory default</label>':'')+'</div><div class="actions"><button class="btn small chk">Check</button><button class="btn small rm" title="Remove">Remove</button></div></div><div class="note res"></div>';
   d.querySelector('.rm').onclick=function(){d.remove();markDirty();};
   d.querySelector('.chk').onclick=function(){var r=d.querySelector('.res');r.className='note';r.textContent='Checking Hedera…';api('check-sensor',{id:d.querySelector('.sid').value.trim(),statusUrl:d.querySelector('.surl').value.trim()}).then(function(j){if(!j.ok){r.className='note bad';r.textContent=j.message;return;}
     r.className='note '+(j.warning?'warn':'ok');r.textContent='Found — '+j.balance.toFixed(2)+' HBAR'+(j.heartbeatAgeMin!=null?', last heartbeat '+j.heartbeatAgeMin.toFixed(1)+' min ago':'')+(j.device?'; status page: '+j.device:'')+(j.warning?'. '+j.warning:'.');}).catch(function(e){r.className='note bad';r.textContent=e.message;});};
@@ -1151,13 +1449,13 @@ function renderSettings(){var c=S.config;var L=$('sensorList');L.innerHTML='';(S
   $('token').value='';$('token').placeholder=c.tokenSet?'Saved ('+c.tokenHint+') — paste a new one only to replace it':'Paste your Personal Access Token';
   $('tokenNote').className='note '+(c.tokenSet?'ok':'warn');$('tokenNote').textContent=c.tokenSet?'A token is saved.':'No token saved yet — top-ups can\'t run without it.';
   $('lowWater').value=c.lowWater;$('topupAmount').value=c.topupAmount;$('checkEvery').value=c.checkEveryMinutes;
-  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;dirty=false;$('saveNote').textContent='';}
+  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate!==false;dirty=false;$('saveNote').textContent='';}
 function markDirty(){dirty=true;$('saveNote').textContent='Unsaved changes';}
-['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
+['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
 $('addSensor').onclick=function(){$('sensorList').appendChild(sensorRow({id:'',name:'',statusUrl:''}));markDirty();};
 $('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-';for(var i=0;i<10;i++)r+=a[Math.floor(Math.random()*a.length)];$('ntfy').value=r;markDirty();};
-$('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim()});});
-  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked})
+$('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim(),devicePassword:d.querySelector('.spw').value,clearPassword:!!(d.querySelector('.spwreset')&&d.querySelector('.spwreset').checked)});});
+  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked})
   .then(function(){toast(S.service.running?'Saved. The background service picks up the changes within a minute.':'Saved. Now start the background service (step 5).');return refresh(true);}).catch(function(e){toast(e.message,9000);$('saveNote').textContent=e.message;}).then(function(){b.disabled=false;});};
 function svc(action){var btns=[$('svcStart'),$('svcStop')];btns.forEach(function(x){x.disabled=true;});$('svcNote').textContent=action==='install'?'Starting…'+(S.platform==='darwin'&&$('always').checked?' (enter your Mac password in the dialog)':''):'Stopping…';
   api('service',{action:action,always:$('always').checked}).then(function(){toast(action==='install'?'Background service started.':'Background service stopped.');return refresh();}).catch(function(e){toast(e.message,9000);$('svcNote').textContent=e.message;}).then(function(){btns.forEach(function(x){x.disabled=false;});});}
@@ -1200,6 +1498,8 @@ Usage: ${APP} <command>
   install-service     Start automatically in the background at login
                       (macOS: add --always to keep running while logged out)
   uninstall-service   Stop and remove the background service
+  update              Install the latest Sensor Keeper now (it also does this by itself)
+  update-sensors      Check for and install Air!Squitter software updates now
   logs                Show the last 40 log lines
   version             Print the version
 
@@ -1238,6 +1538,22 @@ async function main() {
     case 'uninstall-service': return uninstallService();
     case 'logs': { try { console.log(fs.readFileSync(LOG, 'utf8').trim().split('\n').slice(-40).join('\n')); } catch { console.log('No log yet.'); } return; }
     case 'version': case '--version': case '-v': console.log(VERSION); return;
+    case 'update-sensors': {
+      const c = needCfg();
+      if (!c.sensors.some((x) => x.statusUrl)) { console.log(`No Air!Squitter status page is set up. Run "${APP} setup" to add one.`); return; }
+      await deviceUpdatesAll(c, { force: true });
+      const st = loadState();
+      for (const x of c.sensors.filter((y) => y.statusUrl)) {
+        const du = (st.sensors[x.id] || {}).deviceUpdate || {};
+        console.log(`${x.name || x.id}: ${du.pending ? `installing ${du.pending.to} (was ${du.pending.from}) — the sensor restarts; watch the log` : du.lastResult || 'see log'}`);
+      }
+      return;
+    }
+    case 'update': {
+      const u = await selfUpdate(loadConfig(), { force: process.argv.includes('--force') });
+      console.log(u.updated ? `Updated to v${u.version}. The background service restarts into it within a minute.` : `No update installed: ${u.reason}`);
+      return;
+    }
     default: help();
   }
 }
