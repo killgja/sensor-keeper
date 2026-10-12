@@ -14,7 +14,7 @@ Sensor Keeper runs quietly on any always-on computer (Mac, Windows, Linux, Raspb
 - optionally checks a Jetvision Air!Squitter's status page on your network,
 - alerts you (Discord or phone push) **only** when something needs attention,
 - sends an optional weekly "all good" summary,
-- **keeps itself up to date**, and can **install Air!Squitter software updates** for you.
+- can **keep itself up to date** and **install Air!Squitter software updates** for you (both optional, off by default).
 
 No Claude, no AI, no accounts with us. Nothing costs money — testnet HBAR is free and has no value.
 
@@ -108,8 +108,10 @@ Add `--dry-run` to `check`, `topup` or `run` to see what it would do without req
 
 ## Automatic updates
 
-Both are on by default; turn them off with the "Install updates automatically" box in Settings
-(or answer "n" in `sensor-keeper setup`).
+Both are **off by default**. Turn either one on with its checkbox in Settings ("Keep Sensor Keeper
+up to date automatically" / "Install Air!Squitter software updates automatically"), or answer "y"
+in `sensor-keeper setup`. You can always update by hand with `sensor-keeper update` and
+`sensor-keeper update-sensors`.
 
 **Sensor Keeper itself.** Every 6 hours it checks this project's latest GitHub release. If there's
 a newer version it downloads the build for your computer, checks it against the release's

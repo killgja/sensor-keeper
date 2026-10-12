@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -52,8 +52,8 @@ const DEFAULTS = {
   heartbeatAlertMinutes: 15,
   alerts: { discordWebhook: '', ntfyTopic: '', ntfyServer: 'https://ntfy.sh', ntfyEmail: '' },
   weeklySummary: true,
-  autoUpdate: true,           // keep Sensor Keeper itself up to date from GitHub releases
-  deviceAutoUpdate: true,     // install Air!Squitter software updates (sensors with a status page address)
+  autoUpdate: false,          // opt-in: keep Sensor Keeper itself up to date from GitHub releases
+  deviceAutoUpdate: false,    // opt-in: install Air!Squitter software updates (sensors with a status page address)
   dryRun: false,
 };
 
@@ -583,7 +583,7 @@ async function deviceAutoUpdate(cfg, state, sensor, { force = false } = {}) {
 }
 
 async function deviceUpdatesAll(cfg, opts = {}) {
-  if (cfg.deviceAutoUpdate === false && !opts.force) return;
+  if (cfg.deviceAutoUpdate !== true && !opts.force) return;
   const targets = cfg.sensors.filter((s) => s.statusUrl);
   if (!targets.length) return;
   const state = loadState();
@@ -624,7 +624,7 @@ async function runLoop() {
     cfg = loadConfig() || cfg;   // pick up edits without a restart
     // A newer copy was installed (by "update", the installer, or the app): restart into it.
     if (startMtime && mtime() && mtime() !== startMtime) { log('a new Sensor Keeper version was installed'); restartSelf(); return; }
-    if (cfg.autoUpdate !== false && now() - lastUpdateTry >= UPDATE_EVERY && now() - (loadState().lastUpdateCheck || 0) >= UPDATE_EVERY) {
+    if (cfg.autoUpdate === true && now() - lastUpdateTry >= UPDATE_EVERY && now() - (loadState().lastUpdateCheck || 0) >= UPDATE_EVERY) {
       lastUpdateTry = now();
       const u = await selfUpdate(cfg);
       const s = loadState(); s.lastUpdateCheck = now(); saveState(s);
@@ -812,8 +812,11 @@ Step 4 — alerts (optional, but recommended)
   } else cfg.alerts.ntfyTopic = '';
   cfg.alerts.ntfyEmail = '';
   cfg.weeklySummary = await askYesNo(rl, '  Send a weekly all-good summary?', old.weeklySummary !== false);
-  cfg.autoUpdate = await askYesNo(rl, '\nInstall updates automatically (Sensor Keeper itself, and Air!Squitter software)?', old.autoUpdate !== false);
-  cfg.deviceAutoUpdate = cfg.autoUpdate;
+  console.log('\nAutomatic updates (both off unless you turn them on; you can change this any time in Settings)');
+  cfg.autoUpdate = await askYesNo(rl, '  Keep Sensor Keeper itself up to date automatically?', old.autoUpdate === true);
+  cfg.deviceAutoUpdate = cfg.sensors.some((x) => x.statusUrl)
+    ? await askYesNo(rl, '  Install Air!Squitter software updates automatically?', old.deviceAutoUpdate === true)
+    : old.deviceAutoUpdate === true;
 
   writePrivate(CONFIG, cfg);
   console.log(`\nSaved to ${CONFIG}\n`);
@@ -1223,7 +1226,8 @@ async function runUi() {
         if (hook && !/^https:\/\/(discord\.com|discordapp\.com|ptb\.discord\.com|canary\.discord\.com)\/api\/webhooks\//.test(hook)) return send(res, 400, { error: "That doesn't look like a Discord webhook URL." });
         next.alerts = { ...next.alerts, discordWebhook: hook, ntfyTopic: topic, ntfyEmail: '' };
         next.weeklySummary = !!b.weeklySummary;
-        if (typeof b.autoUpdate === 'boolean') { next.autoUpdate = b.autoUpdate; next.deviceAutoUpdate = b.autoUpdate; }
+        if (typeof b.autoUpdate === 'boolean') next.autoUpdate = b.autoUpdate;
+        if (typeof b.deviceAutoUpdate === 'boolean') next.deviceAutoUpdate = b.deviceAutoUpdate;
         writePrivate(CONFIG, next);
         log('settings saved from the app');
         return send(res, 200, { ok: true, config: publicConfig(next) });
@@ -1399,7 +1403,8 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
       <li>Save, then press "Send test alert" on the Status tab.</li></ol>
     <div class="warnbox">The topic name works like a password — anyone who knows it can read your alerts. Use something unique.</div>
     <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:14px"><input type="checkbox" id="weekly"> Send a weekly "all good" summary</label>
-    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="autoupd"> Install updates automatically (Sensor Keeper itself, and Air!Squitter software)</label></div>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="autoupd"> Keep Sensor Keeper up to date automatically</label>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="devupd"> Install Air!Squitter software updates automatically</label></div>
 
   <div class="card"><h2>5. Run in the background</h2>
     <p class="help" id="svcHelp">Sensor Keeper keeps watch in the background and starts automatically.</p>
@@ -1449,13 +1454,13 @@ function renderSettings(){var c=S.config;var L=$('sensorList');L.innerHTML='';(S
   $('token').value='';$('token').placeholder=c.tokenSet?'Saved ('+c.tokenHint+') — paste a new one only to replace it':'Paste your Personal Access Token';
   $('tokenNote').className='note '+(c.tokenSet?'ok':'warn');$('tokenNote').textContent=c.tokenSet?'A token is saved.':'No token saved yet — top-ups can\'t run without it.';
   $('lowWater').value=c.lowWater;$('topupAmount').value=c.topupAmount;$('checkEvery').value=c.checkEveryMinutes;
-  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate!==false;dirty=false;$('saveNote').textContent='';}
+  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate===true;$('devupd').checked=c.deviceAutoUpdate===true;dirty=false;$('saveNote').textContent='';}
 function markDirty(){dirty=true;$('saveNote').textContent='Unsaved changes';}
-['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
+['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
 $('addSensor').onclick=function(){$('sensorList').appendChild(sensorRow({id:'',name:'',statusUrl:''}));markDirty();};
 $('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-';for(var i=0;i<10;i++)r+=a[Math.floor(Math.random()*a.length)];$('ntfy').value=r;markDirty();};
 $('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim(),devicePassword:d.querySelector('.spw').value,clearPassword:!!(d.querySelector('.spwreset')&&d.querySelector('.spwreset').checked)});});
-  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked})
+  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked})
   .then(function(){toast(S.service.running?'Saved. The background service picks up the changes within a minute.':'Saved. Now start the background service (step 5).');return refresh(true);}).catch(function(e){toast(e.message,9000);$('saveNote').textContent=e.message;}).then(function(){b.disabled=false;});};
 function svc(action){var btns=[$('svcStart'),$('svcStop')];btns.forEach(function(x){x.disabled=true;});$('svcNote').textContent=action==='install'?'Starting…'+(S.platform==='darwin'&&$('always').checked?' (enter your Mac password in the dialog)':''):'Stopping…';
   api('service',{action:action,always:$('always').checked}).then(function(){toast(action==='install'?'Background service started.':'Background service stopped.');return refresh();}).catch(function(e){toast(e.message,9000);$('svcNote').textContent=e.message;}).then(function(){btns.forEach(function(x){x.disabled=false;});});}
