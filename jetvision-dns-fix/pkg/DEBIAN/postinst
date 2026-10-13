@@ -66,6 +66,10 @@ fi
 for s in unbound dnsmasq systemd-resolved; do
   case "$changed" in *"$s"*|*dns-root-data*) if systemctl is-active -q "$s" 2>/dev/null; then systemctl restart "$s" && say "restarted $s"; fi;; esac
 done
+# 4DSKY/Neuron program: it crash-loops while DNS is broken and systemd stops retrying.
+if systemctl list-unit-files 2>/dev/null | grep -q '^neuron-sdk.service'; then
+  systemctl reset-failed neuron-sdk 2>/dev/null; systemctl restart neuron-sdk 2>/dev/null && say "restarted neuron-sdk (4DSKY)"
+fi
 sleep 3
 say "changed:${changed:- nothing (no known resolver trust-anchor files found)}"
 { echo "# getent after"; getent hosts mlat.jetvision.de || echo "lookup FAILED"; getent hosts stun.voipgate.com || echo "stun lookup FAILED"; } >&3 2>&1

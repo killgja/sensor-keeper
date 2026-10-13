@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -596,6 +596,167 @@ async function deviceUpdatesAll(cfg, opts = {}) {
   saveState(state);
 }
 
+// ---------------------------------------------------------------- sensor diagnosis
+// Works out, in plain language, why an Air!Squitter isn't sending heartbeats.
+// Read-only: it never changes anything on the sensor. Used by "diagnose", by
+// alerts (so they say what's wrong and what to do), and by the community fixes.
+const NEURON_PORT = 1337;
+async function tryHttp(url, opts = {}, ms = 8000) {
+  try { return await http(url, opts, ms); } catch (e) { return { ok: false, status: 0, json: null, text: '', error: e.message }; }
+}
+const neuronBase = (statusUrl) => devBase(statusUrl).replace(/:\d+$/, '') + `:${NEURON_PORT}`;
+const ipNum = (ip) => String(ip).split('.').reduce((a, o) => (a * 256) + (parseInt(o, 10) || 0), 0) >>> 0;
+const sameSubnet = (a, b, mask) => ((ipNum(a) & ipNum(mask)) >>> 0) === ((ipNum(b) & ipNum(mask)) >>> 0);
+
+// Static network settings as shown on the sensor's Network page (needs login).
+async function deviceNetwork(statusUrl, cookie) {
+  const r = await http(`${devBase(statusUrl)}/network.html`, { headers: { Cookie: cookie } }, 15000);
+  const forms = (r.text || '').split(/<form\b/i).slice(1).map((f) => f.split(/<\/form>/i)[0]);
+  const out = [];
+  for (const f of forms) {
+    const val = (name) => ((f.match(new RegExp(`<input[^>]*name="${name}"[^>]*>`, 'i')) || [''])[0].match(/value="([^"]*)"/) || [])[1] || '';
+    const dhcpChecked = (f.match(/<input[^>]*name="dhcp"[^>]*>/gi) || []).find((x) => /checked/i.test(x));
+    const dhcp = dhcpChecked ? (dhcpChecked.match(/value="([^"]*)"/) || [])[1] : null;
+    const ip = val('ipaddress');
+    if (dhcp === null && !ip) continue;
+    out.push({ wifi: /wifimode|ssid/i.test(f), dhcp: dhcp === '1', ip, netmask: val('ipnetmask'), gateway: val('ipgateway'), dns: val('ipdns') });
+  }
+  return out;
+}
+
+// Does a validating public resolver (Cloudflare) accept stun.voipgate.com again?
+async function voipgateDnssecHealthy() {
+  const r = await tryHttp((process.env.SENSOR_KEEPER_DOH || 'https://cloudflare-dns.com/dns-query') + '?name=stun.voipgate.com&type=A', { headers: { Accept: 'application/dns-json' } }, 10000);
+  return !!(r.json && r.json.Status === 0 && Array.isArray(r.json.Answer) && r.json.Answer.length);
+}
+
+async function diagnoseSensor(cfg, sensor, { heartbeatAgeMin = null } = {}) {
+  const f = [];   // { key, level: ok|warn|bad, text, fix }
+  const add = (key, level, text, fix = '') => f.push({ key, level, text, fix });
+  const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
+  if (!st.json) {
+    add('lan', 'bad', `The sensor doesn't answer on your network (${sensor.statusUrl}).`,
+      'Check that it has power (lights on), and its network cable or Wi-Fi. If it was just restarted, give it 5 minutes.');
+    return f;
+  }
+  add('lan', 'ok', 'The sensor answers on your network.');
+  const mlat = st.json.mlat || {};
+  const ml = await tryHttp(`${devBase(sensor.statusUrl)}/mlatstatus.json`);
+  const connlog = (ml.json && ml.json.mlat && ml.json.mlat.connlog) || '';
+  const dnsBroken = /resolve: Host not found/i.test(connlog);
+  if (mlat.status === 'green') add('internet', 'ok', 'It reaches the internet and can look up names (MLAT connected).');
+  else if (dnsBroken) add('dns', 'bad', "It can't look up internet names (DNS), so MLAT and 4DSKY heartbeats stop.",
+    'Turn on "Install unofficial community fixes" in Sensor Keeper (DNS fix), or install jv-ksk2024-fix from the Sensor Keeper GitHub through the sensor\'s Software Maintenance → Upload and Install page.');
+  else add('internet', 'bad', `MLAT isn't connected (${mlat.desc || mlat.status || 'unknown'}). The sensor probably can't reach the internet.`,
+    "Check the sensor's network settings (gateway and DNS) and your router.");
+
+  // Network settings sanity (needs the admin password; skipped if login fails).
+  try {
+    const cookie = await deviceLogin(sensor.statusUrl, devicePw(sensor));
+    for (const n of await deviceNetwork(sensor.statusUrl, cookie)) {
+      if (n.dhcp || !n.ip || !n.gateway) continue;
+      const kind = n.wifi ? 'Wi-Fi' : 'wired';
+      if (n.netmask && !sameSubnet(n.ip, n.gateway, n.netmask)) {
+        add('gateway', 'bad', `Its ${kind} default gateway is ${n.gateway}, which isn't on its own network (${n.ip}/${n.netmask}). It can talk to your house but not the internet.`,
+          `On the sensor's Settings → Network page, set the ${kind} Default Gateway to your router's address (usually the network's .1 address, e.g. ${n.ip.split('.').slice(0, 3).join('.')}.1), or switch to Automatic (DHCP). Save and reboot.`);
+      } else add('gateway', 'ok', `${kind} settings look sane (gateway ${n.gateway}).`);
+    }
+  } catch (e) { add('settings', 'warn', `Couldn't read its network settings (${e.message}).`); }
+
+  // The 4DSKY (Neuron) program that sends heartbeats. Its page on port 1337 is only open
+  // while it waits for setup; once running it closes, so heartbeats are the real signal.
+  const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 6000);
+  const stale = heartbeatAgeMin == null || heartbeatAgeMin > (cfg.heartbeatAlertMinutes || 15);
+  if (nr.ok && /start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text)) add('neuron-setup', 'warn', 'The 4DSKY program is running but waiting for setup.',
+    `Open ${neuronBase(sensor.statusUrl)} and complete the setup wizard (device account ID and the device's private key).`);
+  else if (!stale) add('neuron', 'ok', 'The 4DSKY program is sending heartbeats.');
+  else if (mlat.status === 'green') add('neuron', 'bad', "The sensor's internet works, but the 4DSKY program isn't sending heartbeats — it has probably crashed or is missing.",
+    'Turn on "Install unofficial community fixes" in Sensor Keeper (it checks the program, restarts it, or reinstalls the official package), or reboot the sensor. Do NOT use the :1336/reinstall-package link — it uninstalls first and can fail halfway.');
+
+  if (heartbeatAgeMin != null) {
+    if (heartbeatAgeMin <= (cfg.heartbeatAlertMinutes || 15)) add('heartbeat', 'ok', `Heartbeats are arriving (last ${Math.round(heartbeatAgeMin)} min ago).`);
+    else add('heartbeat', 'bad', `No heartbeat for ${heartbeatAgeMin > 2880 ? Math.round(heartbeatAgeMin / 1440) + ' days' : Math.round(heartbeatAgeMin) + ' min'}.`);
+  }
+  return f;
+}
+// After each check: for sensors in trouble, find out why and alert once per cause, with what to do.
+const DIAG_KEYS = { dns: 'DNS is broken', internet: "can't reach the internet", gateway: 'wrong gateway setting', neuron: '4DSKY program not running', 'neuron-setup': '4DSKY program needs setup' };
+async function diagnoseAll(cfg, results) {
+  const state = loadState();
+  for (const r of results) {
+    const sensor = cfg.sensors.find((x) => x.id === r.id);
+    if (!sensor || !sensor.statusUrl || r.error || r.missing) continue;
+    const st = (state.sensors[r.id] = state.sensors[r.id] || {});
+    const trouble = r.heartbeatAgeMin == null || r.heartbeatAgeMin > cfg.heartbeatAlertMinutes || (r.deviceIssues && r.deviceIssues.length);
+    let found = [];
+    if (trouble) {
+      found = await diagnoseSensor(cfg, sensor, { heartbeatAgeMin: r.heartbeatAgeMin }).catch((e) => { log(`${r.label}: diagnosis failed: ${e.message}`); return null; });
+      if (!found) continue;
+      st.diagnosis = { t: now(), findings: found };
+      const bad = found.filter((x) => x.level !== 'ok' && DIAG_KEYS[x.key]);
+      if (bad.length) log(`${r.label}: diagnosis: ${bad.map((x) => x.text).join(' | ')}`);
+    } else delete st.diagnosis;
+    for (const [key, short] of Object.entries(DIAG_KEYS)) {
+      const hit = found.find((x) => x.key === key && x.level !== 'ok');
+      await problem(cfg, st, `diag-${key}`, !!hit, `Sensor Keeper: ${r.label}: ${short}`, hit ? `${hit.text}${hit.fix ? `\nWhat to do: ${hit.fix}` : ''}` : '');
+    }
+  }
+  saveState(state);
+}
+
+const diagText = (f) => f.filter((x) => x.level !== 'ok').map((x) => `• ${x.text}${x.fix ? `\n  → ${x.fix}` : ''}`).join('\n');
+
+// Build a tiny Debian package in memory (control + scripts only, no files).
+// Used for the read-only/restart probe, whose version changes every time so
+// the sensor's installer always runs it.
+function tarFile(name, body, mode) {
+  const h = Buffer.alloc(512);
+  const w = (s, off, len) => h.write(String(s), off, len, 'ascii');
+  w(name, 0, 100); w(mode.toString(8).padStart(7, '0') + '\0', 100, 8);
+  w('0000000\0', 108, 8); w('0000000\0', 116, 8);
+  w(body.length.toString(8).padStart(11, '0') + '\0', 124, 12);
+  w(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + '\0', 136, 12);
+  w('        ', 148, 8); w('0', 156, 1); w('ustar\0', 257, 6); w('00', 263, 2);
+  let sum = 0; for (const b of h) sum += b;
+  w(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8);
+  return Buffer.concat([h, body, Buffer.alloc((512 - (body.length % 512)) % 512)]);
+}
+function tarGz(files) {
+  const zlib = require('zlib');
+  return zlib.gzipSync(Buffer.concat([...files.map((f) => tarFile(f.name, Buffer.from(f.body), f.mode || 0o644)), Buffer.alloc(1024)]));
+}
+function arArchive(members) {
+  const parts = [Buffer.from('!<arch>\n')];
+  for (const m of members) {
+    const hdr = `${(m.name + '/').padEnd(16)}${String(Math.floor(Date.now() / 1000)).padEnd(12)}0     0     100644  ${String(m.body.length).padEnd(10)}\`\n`;
+    parts.push(Buffer.from(hdr), m.body);
+    if (m.body.length % 2) parts.push(Buffer.from('\n'));
+  }
+  return Buffer.concat(parts);
+}
+function buildDeb({ name, version, description, postinst }) {
+  const control = `Package: ${name}\nVersion: ${version}\nArchitecture: all\nMaintainer: Sensor Keeper community <killgja@users.noreply.github.com>\nPriority: optional\nSection: admin\nDescription: ${description}\n`;
+  return arArchive([
+    { name: 'debian-binary', body: Buffer.from('2.0\n') },
+    { name: 'control.tar.gz', body: tarGz([{ name: './control', body: control }, { name: './postinst', body: postinst, mode: 0o755 }]) },
+    { name: 'data.tar.gz', body: tarGz([]) },
+  ]);
+}
+
+// Probe for the 4DSKY (Neuron) program: reports whether it is installed and running,
+// and restarts it if it has stopped (systemd gives up after repeated crashes). Reads
+// nothing from /etc/neuron-sdk. Output lines start with "SK_".
+const NEURON_PROBE = `#!/bin/sh
+v=$(dpkg-query -W -f='\${Version}' neuron-sdk-package 2>/dev/null); s=$(dpkg-query -W -f='\${Status}' neuron-sdk-package 2>/dev/null)
+case "$s" in *" installed") echo "SK_NEURON_PKG=$v";; *) echo "SK_NEURON_PKG=missing";; esac
+echo "SK_NEURON_SVC=$(systemctl is-active neuron-sdk 2>/dev/null || true)"
+if [ "$(systemctl is-active neuron-sdk 2>/dev/null)" != active ] && systemctl list-unit-files 2>/dev/null | grep -q '^neuron-sdk.service'; then
+  systemctl reset-failed neuron-sdk 2>/dev/null; systemctl restart neuron-sdk 2>/dev/null; sleep 8
+  echo "SK_NEURON_RESTARTED=yes"; echo "SK_NEURON_SVC_AFTER=$(systemctl is-active neuron-sdk 2>/dev/null || true)"
+fi
+exit 0
+`;
+
 // ---------------------------------------------------------------- unofficial community fixes (opt-in)
 // Small fixes written by the Sensor Keeper community — NOT from jetvision or 4DSKY.
 // Off unless you tick "Install unofficial community fixes". Each fix is bundled
@@ -615,20 +776,96 @@ const COMMUNITY_FIXES = [
       'the new key next to the old one in the sensor\'s DNS software (keys checked against IANA\'s official list), ' +
       'restarts that DNS software, and writes a report to /var/log/jv-ksk2024-fix.log. It also tells the sensor not to ' +
       'security-check one domain, voipgate.com, whose owner\'s DNS security setup is broken: the 4DSKY software looks up ' +
-      'stun.voipgate.com at startup and crashes if it can\'t. DNS security stays on for everything else. Removing the ' +
-      'package restores the original files.',
-    file: 'jv-ksk2024-fix_1.1.0_all.deb',
-    sha256: 'fa29f2ea0ccab2c097b2f2541f7b58af590900d962f7887b8451771db56b7af4',
-    data: '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',
+      'stun.voipgate.com at startup and crashes if it can\'t. DNS security stays on for everything else. Finally it ' +
+      'restarts the 4DSKY program, which stops retrying after crashing many times. Removing the package restores the original files.',
+    file: 'jv-ksk2024-fix_1.1.1_all.deb',
+    sha256: '1b1c22efba2c7e1e69ff6deda1e0a96b0bf64e47c3e93498d677b9e0b5c204e6',
+    data: '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',
     // The sensor shows the problem: its MLAT client can't resolve names.
     async detect(sensor) {
-      const r = await http(`${devBase(sensor.statusUrl)}/mlatstatus.json`, {}, 8000);
+      const r = await tryHttp(`${devBase(sensor.statusUrl)}/mlatstatus.json`, {}, 8000);
       const log = (r.json && r.json.mlat && r.json.mlat.connlog) || '';
       return /resolve: Host not found/i.test(log);
     },
     // Fixed when MLAT connects again.
     async verify(sensor) {
       const r = await http(`${devBase(sensor.statusUrl)}/status.json`, {}, 8000);
+      return !!(r.json && r.json.mlat && r.json.mlat.status === 'green');
+    },
+  },
+  {
+    id: 'neuron-sdk-repair',
+    title: 'Restart or reinstall the 4DSKY program when heartbeats stop',
+    summary: "Checks the 4DSKY program on the sensor; restarts it if it has stopped, or reinstalls 4DSKY's official package if it's missing.",
+    description:
+      'The 4DSKY program (Neuron SDK) is what sends heartbeats. If heartbeats have stopped for 30 minutes while the sensor\'s ' +
+      'internet and DNS work, Sensor Keeper installs a tiny read-only probe through the sensor\'s "Upload and Install" page. ' +
+      'It reports whether the program is installed and running, and restarts it if it has stopped (systemd gives up after ' +
+      "repeated crashes). Only if the program is missing does Sensor Keeper download 4DSKY's official package from Neuron's " +
+      'public GitHub (NeuronInnovations/neuron-packages), check it against the checksum pinned in device-updates.json, and ' +
+      "install it. Existing 4DSKY settings are kept; if it asks for setup you'll be told to finish its wizard (it needs the " +
+      "device's private key, which Sensor Keeper never stores). Tried at most twice, a day apart.",
+    retryable: true,
+    async detect(sensor, ctx) {
+      const hb = ctx.st.problems && ctx.st.problems.heartbeat;
+      if (!hb || now() - hb.since < 30 * 60000) return false;
+      const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
+      if (!(st.json && st.json.mlat && st.json.mlat.status === 'green')) return false;   // fix internet/DNS first
+      const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 6000);
+      return !(nr.ok && /start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text));   // waiting for setup: the owner must finish it
+    },
+    async run(cfg, sensor, label, fx) {
+      const probe = buildDeb({ name: 'sk-neuron-probe', version: `1.0.${Math.floor(Date.now() / 1000)}`,
+        description: 'Sensor Keeper probe: is the 4DSKY program installed and running', postinst: NEURON_PROBE });
+      const out = await installDeb(sensor, probe, 'sk-neuron-probe_all.deb', 'sk-neuron-probe');
+      const val = (k) => ((out.match(new RegExp(`SK_${k}=([^\\s<]*)`)) || [])[1] || '');
+      const pkg = val('NEURON_PKG');
+      fx.probe = { t: now(), pkg, svc: val('NEURON_SVC'), restarted: val('NEURON_RESTARTED') === 'yes', after: val('NEURON_SVC_AFTER') };
+      log(`${label}: 4DSKY probe: package ${pkg || '?'}, service ${fx.probe.svc || '?'}${fx.probe.restarted ? `, restarted -> ${fx.probe.after || '?'}` : ''}`);
+      if (pkg !== 'missing') return fx.probe.restarted ? 'restarted the 4DSKY program' : 'the 4DSKY program is installed and running';
+      const r = await http(DEVICE_MANIFEST, {}, 15000);
+      const n = r.ok && r.json && r.json.neuronSdk;
+      if (!n || !n.url || !/^[0-9a-f]{64}$/.test(n.sha256 || '')) throw new Error('the 4DSKY program is missing, but no official package is pinned in device-updates.json');
+      const buf = await download(n.url, 300000);
+      if (require('crypto').createHash('sha256').update(buf).digest('hex') !== n.sha256) throw new Error("the downloaded 4DSKY package doesn't match the pinned checksum — not installed");
+      await installDeb(sensor, buf, `neuron-sdk-package_${n.version || 'latest'}_armhf.deb`, 'neuron-sdk-package');
+      return `reinstalled the official 4DSKY package ${n.version || ''}`.trim();
+    },
+    // Worked if heartbeats are back, or the program is up and waiting for setup.
+    async verify(sensor) {
+      const hb = await getHeartbeats(sensor.id).catch(() => ({}));
+      if (hb.lastAgeMin != null && hb.lastAgeMin < 15) return true;
+      const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 8000);
+      return !!(nr.ok && /start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text));
+    },
+    async after(cfg, sensor, label) {
+      const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 8000);
+      if (/start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text || '')) {
+        await sendAlert(cfg, `Sensor Keeper: ${label} needs its 4DSKY setup`, `The 4DSKY program is back but is asking to be set up. Open ${neuronBase(sensor.statusUrl)} and complete the wizard with the device account ID and the device's private key (Sensor Keeper never stores private keys).`, 'high');
+      }
+    },
+  },
+  {
+    id: 'jv-voipgate-cleanup',
+    title: 'Remove the voipgate.com DNS exception once it is no longer needed',
+    summary: "voipgate.com's DNS security works again, so the exception added by the DNS fix is removed.",
+    description:
+      'The DNS fix tells the sensor not to security-check voipgate.com, because that domain\'s DNS security was broken. ' +
+      'Sensor Keeper checks every few hours with Cloudflare\'s validating DNS; once voipgate.com passes again, this ' +
+      'installs jv-ksk2024-fix 1.2.0, which removes the exception (keeping the new root key) so every lookup is checked again. ' +
+      'Only runs on sensors where Sensor Keeper installed the DNS fix.',
+    file: 'jv-ksk2024-fix_1.2.0_all.deb',
+    sha256: '186750ed51b0413de37c04a6ee598beea056e4fbab3fc8e713e51e382bcfea77',
+    data: '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',
+    async detect(sensor, ctx) {
+      const dns = ctx.st.fixes && ctx.st.fixes['jv-ksk2024-fix'];
+      if (!dns || !dns.applied) return false;
+      if (ctx.fx.lastHealthCheck && now() - ctx.fx.lastHealthCheck < 6 * 3600 * 1000) return false;
+      ctx.fx.lastHealthCheck = now();
+      return voipgateDnssecHealthy();
+    },
+    async verify(sensor) {
+      const r = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`, {}, 8000);
       return !!(r.json && r.json.mlat && r.json.mlat.status === 'green');
     },
   },
@@ -642,23 +879,34 @@ async function retiredFixes() {
   } catch { return []; }
 }
 
-async function installFixPackage(sensor, fix) {
+async function fixPackage(fix) {
+  if (fix.getPackage) return fix.getPackage();
   const buf = Buffer.from(fix.data, 'base64');
   const got = require('crypto').createHash('sha256').update(buf).digest('hex');
   if (got !== fix.sha256) throw new Error('bundled package failed its checksum — not installed');
+  return { buf, file: fix.file, pkg: fix.file.split('_')[0] };
+}
+
+async function installFixPackage(sensor, fix) {
+  const { buf, file, pkg } = await fixPackage(fix);
+  return installDeb(sensor, buf, file, pkg);
+}
+
+// Upload + install a .deb through the sensor's Software Maintenance page; returns its output.
+async function installDeb(sensor, buf, file, pkg) {
   const cookie = await deviceLogin(sensor.statusUrl, devicePw(sensor));
   const form = new FormData();
-  form.append('uploadinstallconf', new Blob([buf], { type: 'application/vnd.debian.binary-package' }), fix.file);
+  form.append('uploadinstallconf', new Blob([buf], { type: 'application/vnd.debian.binary-package' }), file);
   const res = await fetch(`${devBase(sensor.statusUrl)}/maintenance_file_install_post.html`, {
     method: 'POST', body: form, headers: { Cookie: cookie, 'User-Agent': `${APP}/${VERSION}` }, signal: AbortSignal.timeout(180000),
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`sensor answered HTTP ${res.status}`);
-  const pkg = fix.file.split('_')[0];
   if (!new RegExp(`Setting up ${pkg}`).test(text)) {
     const tail = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(-300);
     throw new Error(`the sensor didn't confirm the install (${tail})`);
   }
+  return text;
 }
 
 // One fix on one sensor. Called from the run loop and by "apply-fix".
@@ -671,9 +919,10 @@ async function applyFix(cfg, state, sensor, fix, { force = false } = {}) {
     const ok = await fix.verify(sensor).catch(() => false);
     delete fx.pending;
     if (ok) {
-      fx.applied = now(); fx.result = 'installed and working';
+      fx.applied = now(); fx.result = 'installed and working'; delete fx.failed;
       log(`${label}: community fix ${fix.id} installed and working`);
-      await sendAlert(cfg, `Sensor Keeper: ${label} fixed`, `The unofficial "${fix.title}" fix was installed and the sensor is working again.`, 'default');
+      await sendAlert(cfg, `Sensor Keeper: ${label} fixed`, `The unofficial "${fix.title}" fix was installed and worked.`, 'default');
+      if (fix.after) await fix.after(cfg, sensor, label).catch(() => {});
     } else {
       fx.failed = now(); fx.result = 'installed, but the problem is still there';
       log(`${label}: community fix ${fix.id} installed but the problem remains`);
@@ -681,18 +930,20 @@ async function applyFix(cfg, state, sensor, fix, { force = false } = {}) {
     }
     return fx.result;
   }
-  if (!force && (fx.applied || fx.failed)) return fx.result || 'already handled';
-  if (!(await fix.detect(sensor).catch(() => false))) { fx.result = "not needed (the sensor doesn't show this problem)"; return fx.result; }
+  const canRetry = fix.retryable && fx.failed && !fx.applied && (fx.tries || 0) < 2 && now() - fx.failed > DAY;
+  if (!force && (fx.applied || (fx.failed && !canRetry))) return fx.result || 'already handled';
+  if (!(await fix.detect(sensor, { st, fx }).catch(() => false))) { fx.result = "not needed (the sensor doesn't show this problem)"; return fx.result; }
   if (cfg.dryRun) { log(`[dry-run] ${label}: would install community fix ${fix.id}`); return 'dry-run'; }
   log(`${label}: installing unofficial community fix ${fix.id}`);
   await sendAlert(cfg, `Sensor Keeper: installing a fix on ${label}`, `Unofficial community fix (not from jetvision or 4DSKY): ${fix.title}.\n${fix.summary}`, 'default');
   try {
-    await installFixPackage(sensor, fix);
-    fx.pending = now(); fx.result = 'installed — checking it worked in a few minutes';
+    fx.tries = (fx.tries || 0) + 1;
+    const did = fix.run ? await fix.run(cfg, sensor, label, fx) : (await installFixPackage(sensor, fix), 'installed');
+    fx.pending = now(); fx.result = `${did} — checking it worked in a few minutes`;
   } catch (e) {
     fx.failed = now(); fx.result = `install failed: ${e.message}`;
     log(`${label}: community fix ${fix.id} failed: ${e.message}`);
-    await sendAlert(cfg, `Sensor Keeper: fix failed on ${label}`, `Couldn't install "${fix.title}": ${e.message}. It won't be tried again automatically.`, 'high');
+    await sendAlert(cfg, `Sensor Keeper: fix failed on ${label}`, `Couldn't install "${fix.title}": ${e.message}.${fix.retryable && (fx.tries || 0) < 2 ? ' I\'ll try once more in a day.' : " It won't be tried again automatically."}`, 'high');
   }
   return fx.result;
 }
@@ -765,6 +1016,7 @@ async function runLoop() {
         }
         await deviceUpdatesAll(cfg);
         await communityFixesAll(cfg);
+        await diagnoseAll(cfg, results).catch((e) => log(`diagnosis failed: ${e.message}`));
       } catch (e) { log(`check failed: ${e.stack || e.message}`); }
     }
     await sleep(60000);
@@ -1640,6 +1892,7 @@ Usage: ${APP} <command>
   uninstall-service   Stop and remove the background service
   update              Install the latest Sensor Keeper now (it also does this by itself)
   update-sensors      Check for and install Air!Squitter software updates now
+  diagnose            Explain in plain language what's wrong with a sensor and what to do
   fixes               List unofficial community fixes and whether your sensors need them
   apply-fix <id>      Install a community fix now (only if the sensor shows the problem)
   logs                Show the last 40 log lines
@@ -1680,6 +1933,19 @@ async function main() {
     case 'uninstall-service': return uninstallService();
     case 'logs': { try { console.log(fs.readFileSync(LOG, 'utf8').trim().split('\n').slice(-40).join('\n')); } catch { console.log('No log yet.'); } return; }
     case 'version': case '--version': case '-v': console.log(VERSION); return;
+    case 'diagnose': {
+      const c = needCfg();
+      const { results } = await checkAll(c);
+      for (const r of results) {
+        console.log(describe(r));
+        const sensor = c.sensors.find((x) => x.id === r.id);
+        if (!sensor || !sensor.statusUrl) { console.log('  (no Air!Squitter status page set up, so no deeper checks)\n'); continue; }
+        const f = await diagnoseSensor(c, sensor, { heartbeatAgeMin: r.heartbeatAgeMin });
+        for (const x of f) console.log(`  ${x.level === 'ok' ? '✓' : x.level === 'warn' ? '!' : '✗'} ${x.text}${x.fix ? `\n      → ${x.fix}` : ''}`);
+        console.log('');
+      }
+      return;
+    }
     case 'fixes': {
       console.log('Unofficial community fixes (not from jetvision or 4DSKY). Turn on automatic install in Settings,');
       console.log(`or install one by hand with: ${APP} apply-fix <id>\n`);

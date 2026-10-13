@@ -101,6 +101,8 @@ sensor-keeper logs          last 40 log lines
 sensor-keeper test-alert    make sure alerts reach you
 sensor-keeper update        install the latest Sensor Keeper now
 sensor-keeper update-sensors  check for and install Air!Squitter software now
+sensor-keeper diagnose      explain what's wrong with a sensor and what to do
+sensor-keeper fixes         list unofficial community fixes and whether you need them
 sensor-keeper uninstall-service
 ```
 
@@ -144,7 +146,21 @@ installs one by hand.
 
 | Fix | What it does |
 | --- | --- |
-| `jv-ksk2024-fix` — DNS fix for the October 2026 internet root-key change | On 11 Oct 2026 the DNS root key changed from KSK-2017 to KSK-2024. Air!Squitters only trust the old key, so every name lookup fails ("Host not found"): MLAT and 4DSKY heartbeats stop. The fix adds the new key (checked against IANA's official list) next to the old one in the sensor's DNS software and restarts it. DNS security stays on; nothing else changes; uninstalling the package restores the original files. Source: [`jetvision-dns-fix/`](jetvision-dns-fix). |
+| `jv-ksk2024-fix` — DNS fix for the October 2026 internet root-key change | On 11 Oct 2026 the DNS root key changed (KSK-2017 → KSK-2024). Air!Squitters only trusted the old key, so every name lookup failed ("Host not found"): MLAT and 4DSKY heartbeats stopped. Adds the new key (checked against IANA's list), adds a narrow exception for `voipgate.com` (its DNS security is broken upstream and the 4DSKY program needs `stun.voipgate.com` at startup), and restarts the 4DSKY program. DNS security stays on for everything else. Source: [`jetvision-dns-fix/`](jetvision-dns-fix). |
+| `neuron-sdk-repair` — Restart or reinstall the 4DSKY program when heartbeats stop | If heartbeats have stopped for 30 minutes while the sensor's internet and DNS work, installs a tiny read-only probe (through the same Upload and Install page) that reports whether the 4DSKY program is installed and running, and **restarts it** if it has stopped. Only if the program is **missing** does it download 4DSKY's official package from Neuron's public GitHub, check it against the checksum pinned in [`device-updates.json`](device-updates.json), and install it. Existing 4DSKY settings are kept; if it asks for setup you're told to finish its wizard (it needs your private key — Sensor Keeper never stores private keys). At most two tries, a day apart. |
+| `jv-voipgate-cleanup` — Remove the voipgate.com exception when it's no longer needed | Every 6 hours checks with Cloudflare's validating DNS whether `voipgate.com` passes again; once it does, installs jv-ksk2024-fix 1.2.0, which removes the exception so every lookup is checked again. Only on sensors where Sensor Keeper installed the DNS fix. |
+
+### Problems Sensor Keeper explains but doesn't change for you
+
+When a sensor stops sending heartbeats, Sensor Keeper works out why and alerts you once per cause with what
+to do (also `sensor-keeper diagnose`): sensor unreachable on your network (power/cable/Wi-Fi), no internet,
+DNS broken, **a static gateway outside the sensor's own network** (e.g. 1.1.1.1 — it can reach your house but
+not the internet), 4DSKY program not sending heartbeats although the internet works, or 4DSKY program waiting for setup. Sensor Keeper never changes
+the sensor's network settings itself: a wrong guess there could take the sensor off your network until someone
+fixes it by hand.
+
+> Never use the sensor's `:1336/reinstall-package` link to "fix" the 4DSKY program: it uninstalls first and,
+> if the download then fails, leaves the program removed.
 
 ## Alerts
 

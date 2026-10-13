@@ -1,0 +1,16 @@
+Package: jv-ksk2024-fix
+Version: 1.2.0
+Architecture: all
+Maintainer: Sensor Keeper community <killgja@users.noreply.github.com>
+Priority: optional
+Section: net
+Description: Add the DNSSEC root key KSK-2024 to local resolvers
+ The DNS root key-signing key changed to KSK-2024 (key tag 38696) on
+ 11 October 2026. Validating resolvers that only trust the old key
+ (KSK-2017, tag 20326) fail every lookup. This package adds KSK-2024
+ (keeping KSK-2017) wherever a local resolver keeps its trust anchors,
+ restarts that resolver, and writes a report to
+ /var/log/jv-ksk2024-fix.log (also copied next to the web pages as
+ jv-ksk2024-fix.txt). Version 1.2.0 removes the voipgate.com exception added by 1.1.x
+ (voipgate.com DNSSEC works again). Removing the package restores the original files.
+ Unofficial; not from jetvision.

@@ -1,0 +1,77 @@
+#!/bin/sh
+# Adds the DNSSEC root KSK-2024 trust anchor. Never disables DNSSEC.
+set +e
+D=/usr/share/jv-ksk2024-fix
+B=/var/lib/jv-ksk2024-fix/backup
+LOG=/var/log/jv-ksk2024-fix.log
+mkdir -p "$B"
+exec 3>>"$LOG"
+say() { echo "$(date -u +%FT%TZ) $*" >&3; }
+backup() { [ -e "$1" ] || return 0; d="$B$(dirname "$1")"; mkdir -p "$d"; [ -e "$B$1" ] || cp -a "$1" "$B$1"; echo "$1" >> "$B/.files"; }
+say "=== jv-ksk2024-fix postinst ($1) ==="
+say "--- diagnostics"
+{ echo "# uname"; uname -a; echo "# resolv.conf"; cat /etc/resolv.conf; ls -l /etc/resolv.conf;
+  echo "# listening on :53"; (ss -lunpt 2>/dev/null || netstat -lunpt 2>/dev/null) | grep -E ':53\b' ;
+  echo "# resolver processes"; ps -eo pid,args 2>/dev/null | grep -E 'unbound|dnsmasq|named|resolved|stubby|knot|pdns' | grep -v grep;
+  echo "# packages"; dpkg -l 2>/dev/null | grep -E 'unbound|dnsmasq|bind9|systemd|dns-root-data|libunbound|ldns|getdns|libc6 ' | awk '{print $1,$2,$3}';
+  echo "# anchor files"; ls -l /usr/share/dns /var/lib/unbound /etc/unbound /usr/share/dnsmasq-base /etc/dnssec-trust-anchors.d /etc/bind/bind.keys 2>&1;
+  echo "# trust-anchor config lines"; grep -rnsE 'trust-anchor|auto-trust-anchor-file|dnssec|DNSSEC' /etc/unbound /etc/dnsmasq.conf /etc/dnsmasq.d /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d /etc/bind 2>/dev/null | head -50;
+  echo "# getent before"; getent hosts mlat.jetvision.de || echo "lookup FAILED";
+} >&3 2>&1
+changed=""
+# 1. dns-root-data (used by dnsmasq/unbound packaging)
+if [ -d /usr/share/dns ]; then
+  for f in root.key root.ds; do backup /usr/share/dns/$f; cp "$D/$f" /usr/share/dns/$f; done
+  say "updated /usr/share/dns/root.key and root.ds"; changed="$changed dns-root-data"
+fi
+# 2. unbound auto-trust-anchor files (RFC 5011 state). Re-seed with both keys.
+for f in /var/lib/unbound/root.key /etc/unbound/root.key; do
+  if [ -f "$f" ]; then
+    backup "$f"; owner=$(stat -c %U:%G "$f" 2>/dev/null)
+    cp "$D/root.key" "$f"; [ -n "$owner" ] && chown "$owner" "$f"
+    say "re-seeded $f"; changed="$changed unbound"
+  fi
+done
+# unbound with inline trust-anchor statements
+if grep -rqsE '^\s*trust-anchor:' /etc/unbound 2>/dev/null && [ -d /etc/unbound/unbound.conf.d ]; then
+  printf 'server:\n    trust-anchor: ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16"\n' > /etc/unbound/unbound.conf.d/jv-ksk2024.conf
+  echo /etc/unbound/unbound.conf.d/jv-ksk2024.conf >> "$B/.created"; say "added inline unbound trust-anchor"; changed="$changed unbound"
+fi
+# 3. dnsmasq trust anchors
+for f in /usr/share/dnsmasq-base/trust-anchors.conf /usr/share/dnsmasq/trust-anchors.conf /etc/dnsmasq.d/trust-anchors.conf; do
+  if [ -f "$f" ] && ! grep -q 38696 "$f"; then backup "$f"; grep 38696 "$D/dnsmasq-trust-anchors.conf" >> "$f"; say "added KSK-2024 to $f"; changed="$changed dnsmasq"; fi
+done
+for f in /etc/dnsmasq.conf /etc/dnsmasq.d/*; do
+  if [ -f "$f" ] && grep -qE '^\s*trust-anchor=' "$f" && ! grep -q 38696 "$f"; then backup "$f"; grep 38696 "$D/dnsmasq-trust-anchors.conf" >> "$f"; say "added KSK-2024 to $f"; changed="$changed dnsmasq"; fi
+done
+# 4. systemd-resolved with DNSSEC on: add a positive anchor file
+if [ -d /run/systemd/resolve ] || systemctl is-active -q systemd-resolved 2>/dev/null; then
+  mkdir -p /etc/dnssec-trust-anchors.d
+  [ -e /etc/dnssec-trust-anchors.d/root.positive ] && backup /etc/dnssec-trust-anchors.d/root.positive || echo /etc/dnssec-trust-anchors.d/root.positive >> "$B/.created"
+  cp "$D/root.ds" /etc/dnssec-trust-anchors.d/root.positive; say "wrote /etc/dnssec-trust-anchors.d/root.positive"; changed="$changed systemd-resolved"
+fi
+# 4b. voipgate.com's DNSSEC works again: remove the exception added by 1.1.x.
+if [ -e /etc/dnssec-trust-anchors.d/jv-broken-dnssec.negative ]; then
+  rm -f /etc/dnssec-trust-anchors.d/jv-broken-dnssec.negative
+  say "removed the voipgate.com DNSSEC exception (no longer needed)"; changed="$changed systemd-resolved"
+fi
+# 5. BIND: report only
+[ -f /etc/bind/bind.keys ] && ! grep -q 38696 /etc/bind/bind.keys && say "NOTE: BIND present; bind.keys lacks KSK-2024 (not changed)"
+# restart whatever we touched
+for s in unbound dnsmasq systemd-resolved; do
+  case "$changed" in *"$s"*|*dns-root-data*) if systemctl is-active -q "$s" 2>/dev/null; then systemctl restart "$s" && say "restarted $s"; fi;; esac
+done
+# 4DSKY/Neuron program: it crash-loops while DNS is broken and systemd stops retrying.
+if systemctl list-unit-files 2>/dev/null | grep -q '^neuron-sdk.service'; then
+  systemctl reset-failed neuron-sdk 2>/dev/null; systemctl restart neuron-sdk 2>/dev/null && say "restarted neuron-sdk (4DSKY)"
+fi
+sleep 3
+say "changed:${changed:- nothing (no known resolver trust-anchor files found)}"
+{ echo "# getent after"; getent hosts mlat.jetvision.de || echo "lookup FAILED"; getent hosts stun.voipgate.com || echo "stun lookup FAILED"; } >&3 2>&1
+# also show the result in the install output
+echo "jv-ksk2024-fix: $(getent hosts mlat.jetvision.de >/dev/null && echo 'mlat.jetvision.de OK' || echo 'mlat.jetvision.de FAILED'), $(getent hosts stun.voipgate.com >/dev/null && echo 'stun.voipgate.com OK' || echo 'stun.voipgate.com FAILED')"
+# make the report readable from the sensor's web server
+for w in $(dirname $(find / -xdev -name systemstatus.html -path '*www*' 2>/dev/null | head -3) 2>/dev/null) /var/www/html /var/www; do
+  [ -d "$w" ] && cp "$LOG" "$w/jv-ksk2024-fix.txt" 2>/dev/null && chmod 644 "$w/jv-ksk2024-fix.txt" && { echo "$w/jv-ksk2024-fix.txt" >> "$B/.created"; break; }
+done
+exit 0

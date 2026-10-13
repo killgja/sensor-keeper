@@ -1,4 +1,10 @@
 {
-  "_comment": "Pin an Air!Squitter software version that every Sensor Keeper should install, e.g. a hotfix jetvision does not offer automatically. Set airsquitter to null when nothing is pinned. Sensor Keeper only ever moves a sensor forward, never back.",
-  "airsquitter": null
+  "_comment": "Read by every Sensor Keeper. airsquitter: pin an Air!Squitter software version to install (forward only), or null. neuronSdk: the official 4DSKY package used by the opt-in 'neuron-sdk-reinstall' fix — only installed if the download matches this sha256. retiredFixes: ids of community fixes to stop using (e.g. once an official fix ships).",
+  "airsquitter": null,
+  "neuronSdk": {
+    "version": "0.52.41",
+    "url": "https://raw.githubusercontent.com/NeuronInnovations/neuron-packages/main/sdk-package.ddeb",
+    "sha256": "ccf8460257421e2ca8a6bd4586cb82236649eb4d3ae908459891a9551a3b1fbd"
+  },
+  "retiredFixes": []
 }
