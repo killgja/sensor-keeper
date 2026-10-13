@@ -1,0 +1,12 @@
+#!/bin/sh
+# Restore everything the fix changed.
+set +e
+B=/var/lib/jv-ksk2024-fix/backup
+case "$1" in remove|purge)
+  [ -f "$B/.files" ] && sort -u "$B/.files" | while read -r f; do [ -e "$B$f" ] && cp -a "$B$f" "$f"; done
+  [ -f "$B/.created" ] && sort -u "$B/.created" | while read -r f; do rm -f "$f"; done
+  for s in unbound dnsmasq systemd-resolved; do systemctl is-active -q "$s" 2>/dev/null && systemctl restart "$s"; done
+  rm -rf /var/lib/jv-ksk2024-fix
+  echo "$(date -u +%FT%TZ) jv-ksk2024-fix removed; originals restored" >> /var/log/jv-ksk2024-fix.log
+;; esac
+exit 0

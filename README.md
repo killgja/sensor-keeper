@@ -130,6 +130,22 @@ For urgent fixes jetvision doesn't offer automatically, a version can be pinned 
 never a downgrade). Note: the sensor downloads updates from jetvision itself, so it needs working
 internet access to update.
 
+## Unofficial community fixes (opt-in)
+
+Sometimes a sensor breaks in a way jetvision or 4DSKY haven't fixed yet. Sensor Keeper can carry
+small **unofficial** fixes written by the community. They are **off unless you tick "Install
+unofficial community fixes"** in Settings (or answer "y" in setup). When on, a fix is installed only
+on a sensor that shows the exact problem it fixes, only once, through the sensor's own *Software
+Maintenance → Upload and Install* page. You're told before and after, and if it doesn't help it is
+not retried. Fixes are retired as soon as an official fix ships.
+
+`sensor-keeper fixes` lists them and whether your sensors need them; `sensor-keeper apply-fix <id>`
+installs one by hand.
+
+| Fix | What it does |
+| --- | --- |
+| `jv-ksk2024-fix` — DNS fix for the October 2026 internet root-key change | On 11 Oct 2026 the DNS root key changed from KSK-2017 to KSK-2024. Air!Squitters only trust the old key, so every name lookup fails ("Host not found"): MLAT and 4DSKY heartbeats stop. The fix adds the new key (checked against IANA's official list) next to the old one in the sensor's DNS software and restarts it. DNS security stays on; nothing else changes; uninstalling the package restores the original files. Source: [`jetvision-dns-fix/`](jetvision-dns-fix). |
+
 ## Alerts
 
 | Channel | How |

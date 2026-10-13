@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.2.1';
+const VERSION = '1.3.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -54,6 +54,7 @@ const DEFAULTS = {
   weeklySummary: true,
   autoUpdate: false,          // opt-in: keep Sensor Keeper itself up to date from GitHub releases
   deviceAutoUpdate: false,    // opt-in: install Air!Squitter software updates (sensors with a status page address)
+  communityFixes: false,      // opt-in: install UNOFFICIAL community fixes for Air!Squitter problems (see COMMUNITY_FIXES)
   dryRun: false,
 };
 
@@ -133,9 +134,10 @@ async function getHeartbeats(id, limit = 25) {
   const lastAgeMin = (now() - ts[0]) / 60000;
   let burnPerDay = null;
   if (ts.length >= 5) {
-    const spanSec = (ts[0] - ts[ts.length - 1]) / 1000;
+    // Typical spacing between heartbeats, ignoring gaps from outages.
+    const gaps = ts.slice(1).map((t, i) => (ts[i] - t) / 1000).filter((g) => g > 0 && g < 600).sort((a, b) => a - b);
     const avgFee = list.reduce((a, t) => a + hbar(t.charged_tx_fee || 0), 0) / list.length;
-    if (spanSec > 0) burnPerDay = avgFee * (86400 / (spanSec / (ts.length - 1)));
+    if (gaps.length >= 3) burnPerDay = avgFee * (86400 / gaps[Math.floor(gaps.length / 2)]);
   }
   return { lastAgeMin, burnPerDay };
 }
@@ -594,6 +596,125 @@ async function deviceUpdatesAll(cfg, opts = {}) {
   saveState(state);
 }
 
+// ---------------------------------------------------------------- unofficial community fixes (opt-in)
+// Small fixes written by the Sensor Keeper community — NOT from jetvision or 4DSKY.
+// Off unless you tick "Install unofficial community fixes". Each fix is bundled
+// here (so it works even when the sensor itself can't reach the internet), is
+// checked against its SHA-256 before use, is only installed on a sensor that shows
+// the exact problem it fixes, and is installed once. A fix can be retired remotely
+// (device-updates.json "retiredFixes") once an official fix ships.
+const COMMUNITY_FIXES = [
+  {
+    id: 'jv-ksk2024-fix',
+    title: 'DNS fix for the October 2026 internet root-key change',
+    summary: 'Adds the new DNS root key (KSK-2024) so the sensor can look up names again (MLAT, 4DSKY heartbeats).',
+    description:
+      'On 11 Oct 2026 the internet\'s DNS root key changed from KSK-2017 to KSK-2024. Air!Squitter software only ' +
+      'trusts the old key, so every name lookup fails ("Host not found"): MLAT stops and 4DSKY heartbeats stop. ' +
+      'This fix installs a tiny package (jv-ksk2024-fix) through the sensor\'s own "Upload and Install" page. It adds ' +
+      'the new key next to the old one in the sensor\'s DNS software (keys checked against IANA\'s official list), ' +
+      'restarts that DNS software, and writes a report to /var/log/jv-ksk2024-fix.log. It also tells the sensor not to ' +
+      'security-check one domain, voipgate.com, whose owner\'s DNS security setup is broken: the 4DSKY software looks up ' +
+      'stun.voipgate.com at startup and crashes if it can\'t. DNS security stays on for everything else. Removing the ' +
+      'package restores the original files.',
+    file: 'jv-ksk2024-fix_1.1.0_all.deb',
+    sha256: 'fa29f2ea0ccab2c097b2f2541f7b58af590900d962f7887b8451771db56b7af4',
+    data: 'ITxhcmNoPgpkZWJpYW4tYmluYXJ5ICAgMTc5MTg0NTM2MCAgMCAgICAgMCAgICAgMTAwNjQ0ICA0ICAgICAgICAgYAoyLjAKY29udHJvbC50YXIuZ3ogIDE3OTE4NDUzNjAgIDAgICAgIDAgICAgIDEwMDY0NCAgMjc1OCAgICAgIGAKH4sIAAAAAAACA+0af2/aSLZ/+1O8dWiBbGwwEJLAJbokNKsqe+mq6a50d+1Jxh6Ii7Gpxw7JlX73e29mbGxD0vSkdreSn5QCM2/evHm/503N1rNvDm2Eg/198YlQ/hTfrf1Ov9vpWwd9Gj846FjPYP/Zd4CEx3YE8CwKw/gxvC/N/6BgtpwwiKPQ/8b67/d6D+nf2se5gv4tq9ttP4N2pf9vDr/ZzsyesgF8uDVmfNZpd3rGxLvT/mAR98JgAJZpmW3tNHJuvJg5cRIhru372j9sL4jxj0UDuGYBDyO4ZGzBInDC+TwJvPge/jbzfH/6wf57wpGcGYQRW/j35tSLb5KxiXgn2m+RF0aIO4BwEeOGtq9d4zZi64DF2ohxJ/IWcuDUdSG+YTC6ur5+eQ6kEpixe7i8vjSIc4hD8EPH9iFiPPRvcVMN3soFGbbBvWngBVOx0rmxgylzaWFGpEETsT2F7mH/qN+EMNDAsuC1E4djPB7i9E34w/Y9146JTrYX8mbHiO7j8gjtSvAa+i7tpEFDbmAd7AninTaaexMmtucDw9X3yHk4SxYmMuxxWEi9gO26PGNNI97YgjZNiTVhecMiIgB26exAuBy8mCt27MC5CSO+pxEKWn2sOE4X7CGGC0tUB+NIDZUVRniIUIPWrR21/HDaKlqJiUPQsH0eotIXHsoxYHe0Qpx8ycZ4jCnRQjWUVsZ3cdOEV8gUrRantHH1FEV6ywr8wgT/bkNvgXOMjGYPjxzy1Ao0QGmNo3DGAkgWPI6YPR+K/Xuj68t/tq5YEoUBXI8ukTzDbXicBGaeHtixBkIeJP03bB7ekoSJRKoFkhcaL5cajbyph4YKE89n3NTg9yCcTDzHs/0hBGhkkwiJfmDxrUcuZGp/7fi/CDmaMY//rPxvda1Ouxz/9zsHVfz/HrDzU2vsBS1+o+1QeOUb8XUdW3M+acKVCDmux+0xOoFaYWqcxfAz00bHrYRHSNWOWClmaGfHMpp449JMa4zeliy0X1//cvxIwNHmM9eLwFiAXjvTNXbHHOienOg1XKdr3L5vNOETMGQTERoYoxkYCfz8/OLt87f/akJtV4eTF90hfNbkfgL932AwRLd0eA+rFfo7JroA2kNwj3EXJONFgT2XKE19CDkeXPyplp9lBJwFGLYkKIeHKUc4cnJCgy1TxA+dOEGuQT8+Pi5FSUh9Exo1qwmIoEtUwzBQ9vY0oHmH61p64B1IiE8kKj6RiWE2I8M8RrxggvMOBv4Wi51WbngIPgfD3xzXIKPiezxmIn9iVB3sd5FUg9OqJFjE0Dlpuey2FSS+T2LADI7uFW+ZbcIKpphhwHgJdSTzblyH/DZZEltEocM4F4LCbGawEBaeu2dHU17cbU0uCcZhErgrN+Bzm39ckSTclaLorjABjMf3qxmG6tUCcerZ2lvxmWdDJQDa3F3MpiScJ26KXuUerfg9SmsuRg1yJwPt0V6h7afoPs6spiymDxx2+kDs2MsZ1D8tIiyxoGbt1Tp7te7nep6xNDcqE1J6Wzsd0oPMz9RmUq/ZjwIy8WyMbUyrAglHOHMM4fOGqhtMRYBOJv4xsa4hJbyw8pzl1wBZjzdFowkEm1JaUcBRYHm8lZ3EYWE3g062kmysZHSpl/hXfBLnwkqLIwpBKaCVaj+HuXUqf8iSqm+Y7YKx384fFjXHUEdjhkUKeZ36jfUJFldz347NdR3gMnIJuVLWenBx+urXlyN9qH2mmCREqamS9FjXMSRbJhRMBxpYSrswvgd1zkwc0lLRL5uaN6GAVNYwvBdlERazoqKagBeICE9alF9cjlYeggyLpdWtGkYHh+LdCL/q22bdMGBIXASoZEGBt8xCK9uPCk21J8Wi9Mi1tB4vHFrXJh7KomNCetgNc5GOAI03F+ewj/UD1XMxa1I5Z3As+2CJdw4Yh/gPGa2pZSIoO8max7y1ZaN0TDykFPEExYGyWAsWUuHR+BDCJV6PjmsNGQMdeP774Pkvck0+FIqFSrbpProigbsE+FVQotzy4gVKC3+txwhPUBCCj+R58cRi+aZk1YFoCUpV6Gwnk6uQkheQuxb9WIhzjqbNybqUG38kN/7PO76bRx2U3DTvQ8i8NMy8ZNVn6n1rYYrwN4E63h0xEQzeBXTIwlag4xXiCkbX8qoGh9CB/mF31Bm1T8/PDs+Pzg6szql11Ds86xxcHPSsjnXUOTrE2d5+e9S3Oue9w+7pRa/XO+2dty/OOmdWX38X1OHkMRZzNYkYScPBVyzJSgAHryvoJ6gpoT28B6GKlAJSCeaP/LhKhZt0zTQ2FK99OZPfHvlbxWgvA+UG6lasQuDdgrHVa8gcflK29FFpUBo9GUDRkwRWijLK2N7cSVVXk6JE8w2CB/xCkcS51C3W8vpCpmntPng+dbotfnJcl2h/cSHsQM8ElSmNNFPKOKFuCdSYwQ3w+o7Vqieu77mYvE5GURKUU66sleWgE/t4kzdsR1BAWWxsmoskWYzI6vBHqhZEE/X5Iygy7Gb8C9WlafDJq9Lk/vQV5SigFdMA5sanE1OqXkZh/BVH3WoFZcmrwNIbb1rCAA1/buMVRfVkRE7isEjGeE+4oUpFdmaUrTRsCtYRc8IIpxKKTUiYIAmoLYcL/otW13ygvxaxCZY/pPuHWjwYqVzDCV3GFd0t3R4MqU5kI3ccMC2rxg/5rhfjrSioUzkHWVEIp6W2lCKsbDxmvs8zbNH+Qfe6ldwz+KDagMi1EpT5g3gEZiypO0MimJkU3j/J0h9ev8Xq01SfV1QuD3/tFmkVKp3haV1FaBRNNe0lNr/GRfZNOHt1NRqkvVPqBWsiJWy7OW3NgNsQEU2c5+r125cDsQNKDG0qiIewxvIxYPFcG5tsUfHbpLuEavqip+KR6Wq9RJGEiYNuKnIdp1yXFh1pCVE+qMp0Dt0UM3HotHJXr3F9d7VbKN13m+RYD9gzLdi04Rx2yrFATIWgBqnC5SJRDYfAuO3IfMV9RklStkkUe4Pap/SbQR56Q1EFxQOzgCrprNWw5UIxIWE0P+cbLOqKZ09iFv3/N77ius0ola2jKSgvzl0Xd2QHneOlQIREPE3ix6QQ+kXNIxsr7zCJF0msSZLFJtMAao0vHKJYwgsi9U2s15f1jO0t05L5enOvvN/m4bftt4lV2G9zOt2PTH9uz5iSjvBLdGyXGpeyVU8TXDxh1bl4tZA3DuEUS5Lkuv9Xa0yoMdAC4w5ZxLsZDUqDpStSws2beO5j+LWxQKrvLpfL3frWNkK3WeyGiWsoorfE+vSX8jaRLvTaMr0AUo1A3U4aa20+rOjlS5dzMw9d6Pd6Dy5ApKxnuh1j88Yyxm8z6l4Kx2N3mD7b2rMKfrD3f+oxR/M/8f9/WFa7W37/sfr96v3ne7//vJGvnPI5WmZJCo30EKHyZ/bA88VHHFUgWKI0iOhNla0WSTRlTRnPJvknEBnWOEVmIylMrLBawW8iYIOBWVl0KLPnlsk6IornFjEiL76qG7neKg1cWzbLprZvF83TS31G9qvqpafWP4KvrcVPti+xEk3gAeFnjekt716llyWpEmQvfc3m6SO3K2L9Yw9wacFVhfwKKqigggoqqKCCCiqooIIKKqigggoqqKCCCiqooIIKKqigggoqqKCCCiqooIIKKqiggu8P/wMD2cb2AFAAAGRhdGEudGFyLmd6ICAgICAxNzkxODQ1MzYwICAwICAgICAwICAgICAxMDA2NDQgIDk4MSAgICAgICBgCh+LCAAAAAAAAgPtlk2TojgAQD33r/Bud0NCEsKhD3yKiuAXoNxQUQRFBUHk16/j1lbtdtXOVO3uODO1eZdQhMohjxd451rfHf6OiPFjvPN5fFwDDIkACRDJl/uiCEGrjVtPoCwuYd5ut/Lj8fK15741/4vyzpVFzv1k/gGPBcj8P89/EYd5xP08/gEREPP/bP9J9ZYWKeQhetvsau4H+kdAwMz/D/a/zopDWJzfLvl9j97CbBUf8+J9dcw2/8A/Qehv/UOC/uofAkhIq80z/9+dP8v9eH+F/F3CK32FrzpPNIQUyivUAJogyRJWeYXXRJVgjacIU51SHvGSoqiECgiLgEdQEFXRoLpKtZdPKwuUSL+vfH9agxovqwpVJUUEUAYSogoUDREBCCQo0fsswrxGAFQRFWQDISQjlTcUqADy0mI8o/8vb/z7uvhvzv+v9o/Ip/MfIwxZ/0/x3+7ZbW3afoTfpm3Y/tfh/7Hko/jHkqz4X7b/NLp97/6BQD7//2EisP6f1D8QIeX5R7P2dKAv2hCLbeHerXzVZTlsuIt8oLdZhoabKMbRrScRf+pF9UyRq3S47TfpYObsfFClvWVTR4bQ4dBk6ztn0czrya4298Zerx1L7uc4OliVLU79+TazYtRRcD3e215DnS1NKzkfXuyJU3vjUg2nWU9ba9ga3PzlZA0zye9GcEJHzVY95IK+9aw8uSm1HzUGn1jm1bNptJkKuZpwur+tev52Kd3FnjxXG3BLTLWwU5zP+0KI7GVZiae8Ex2DbmeaawOS+ZElrIiJ5VPdiFbirUA5662L3rwuHWshI263Vw5Tr9eUmr9ZT9xNbK4XpLPKqGlMDh0YD6mczbvzayFhjAe5q+DzLr7tuyEtyuUc2hlxr/YEyKk780S0dD9evrnvEkmiMs2CfRhN8+om9xMSmBWkcewM0lrIre7cC1WSz2eFtkJI4la79f5ySm/dq9q3M0feG/bAgIlyLALFxVFkFqdw7DsHR98HRdJTh+OhKoSRuezupnEVFDW6DhfTxKSR6OXxsiS7/Ko2niKf9GmydNcn3z/oWRxeYr8EybFT7Ax3N5Hl+iCdb317y12d4HxuLG5tcWc6SlcTFx/dgX5yt5EIhkKUQE5UR+fT2ruWw+OsOiqdwJmhRdS91cPKPCzzem80Xcd0dsmlsTslmI3t8DKHc6VsAnsMBp0CqvN01AuOYkH62+BWhUpULS71qFpYV9RIh4k4gFVoAOouTCmQurbrRuFtsxmoojBarD7Yl4TBYDAYDAaDwWAwGAwGg/G/4jfKdrJDACgAAAo=',
+    // The sensor shows the problem: its MLAT client can't resolve names.
+    async detect(sensor) {
+      const r = await http(`${devBase(sensor.statusUrl)}/mlatstatus.json`, {}, 8000);
+      const log = (r.json && r.json.mlat && r.json.mlat.connlog) || '';
+      return /resolve: Host not found/i.test(log);
+    },
+    // Fixed when MLAT connects again.
+    async verify(sensor) {
+      const r = await http(`${devBase(sensor.statusUrl)}/status.json`, {}, 8000);
+      return !!(r.json && r.json.mlat && r.json.mlat.status === 'green');
+    },
+  },
+];
+const FIX_VERIFY_AFTER = 5 * 60 * 1000;
+
+async function retiredFixes() {
+  try {
+    const r = await http(DEVICE_MANIFEST, {}, 15000);
+    return (r.ok && r.json && Array.isArray(r.json.retiredFixes)) ? r.json.retiredFixes : [];
+  } catch { return []; }
+}
+
+async function installFixPackage(sensor, fix) {
+  const buf = Buffer.from(fix.data, 'base64');
+  const got = require('crypto').createHash('sha256').update(buf).digest('hex');
+  if (got !== fix.sha256) throw new Error('bundled package failed its checksum — not installed');
+  const cookie = await deviceLogin(sensor.statusUrl, devicePw(sensor));
+  const form = new FormData();
+  form.append('uploadinstallconf', new Blob([buf], { type: 'application/vnd.debian.binary-package' }), fix.file);
+  const res = await fetch(`${devBase(sensor.statusUrl)}/maintenance_file_install_post.html`, {
+    method: 'POST', body: form, headers: { Cookie: cookie, 'User-Agent': `${APP}/${VERSION}` }, signal: AbortSignal.timeout(180000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`sensor answered HTTP ${res.status}`);
+  const pkg = fix.file.split('_')[0];
+  if (!new RegExp(`Setting up ${pkg}`).test(text)) {
+    const tail = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(-300);
+    throw new Error(`the sensor didn't confirm the install (${tail})`);
+  }
+}
+
+// One fix on one sensor. Called from the run loop and by "apply-fix".
+async function applyFix(cfg, state, sensor, fix, { force = false } = {}) {
+  const label = sensor.name ? `${sensor.name} (${sensor.id})` : sensor.id;
+  const st = (state.sensors[sensor.id] = state.sensors[sensor.id] || {});
+  const fx = ((st.fixes = st.fixes || {})[fix.id] = st.fixes[fix.id] || {});
+  if (fx.pending) {
+    if (now() - fx.pending < FIX_VERIFY_AFTER) return 'waiting to verify';
+    const ok = await fix.verify(sensor).catch(() => false);
+    delete fx.pending;
+    if (ok) {
+      fx.applied = now(); fx.result = 'installed and working';
+      log(`${label}: community fix ${fix.id} installed and working`);
+      await sendAlert(cfg, `Sensor Keeper: ${label} fixed`, `The unofficial "${fix.title}" fix was installed and the sensor is working again.`, 'default');
+    } else {
+      fx.failed = now(); fx.result = 'installed, but the problem is still there';
+      log(`${label}: community fix ${fix.id} installed but the problem remains`);
+      await sendAlert(cfg, `Sensor Keeper: ${label} fix didn't help`, `The unofficial "${fix.title}" fix was installed, but the sensor still shows the problem. It won't be tried again automatically.`, 'high');
+    }
+    return fx.result;
+  }
+  if (!force && (fx.applied || fx.failed)) return fx.result || 'already handled';
+  if (!(await fix.detect(sensor).catch(() => false))) { fx.result = "not needed (the sensor doesn't show this problem)"; return fx.result; }
+  if (cfg.dryRun) { log(`[dry-run] ${label}: would install community fix ${fix.id}`); return 'dry-run'; }
+  log(`${label}: installing unofficial community fix ${fix.id}`);
+  await sendAlert(cfg, `Sensor Keeper: installing a fix on ${label}`, `Unofficial community fix (not from jetvision or 4DSKY): ${fix.title}.\n${fix.summary}`, 'default');
+  try {
+    await installFixPackage(sensor, fix);
+    fx.pending = now(); fx.result = 'installed — checking it worked in a few minutes';
+  } catch (e) {
+    fx.failed = now(); fx.result = `install failed: ${e.message}`;
+    log(`${label}: community fix ${fix.id} failed: ${e.message}`);
+    await sendAlert(cfg, `Sensor Keeper: fix failed on ${label}`, `Couldn't install "${fix.title}": ${e.message}. It won't be tried again automatically.`, 'high');
+  }
+  return fx.result;
+}
+
+async function communityFixesAll(cfg, opts = {}) {
+  if (cfg.communityFixes !== true && !opts.force) return [];
+  const sensors = cfg.sensors.filter((s) => s.statusUrl);
+  if (!sensors.length) return [];
+  const retired = await retiredFixes();
+  const state = loadState();
+  const out = [];
+  for (const s of sensors) {
+    for (const fix of COMMUNITY_FIXES) {
+      if (retired.includes(fix.id) || (opts.only && opts.only !== fix.id)) continue;
+      try { out.push({ sensor: s, fix, result: await applyFix(cfg, state, s, fix, opts) }); }
+      catch (e) { log(`${s.id}: community fix ${fix.id} error: ${e.message}`); }
+    }
+  }
+  saveState(state);
+  return out;
+}
+
 // ---------------------------------------------------------------- run loop
 function acquireLock() {
   ensureHome();
@@ -643,6 +764,7 @@ async function runLoop() {
           saveState(state);
         }
         await deviceUpdatesAll(cfg);
+        await communityFixesAll(cfg);
       } catch (e) { log(`check failed: ${e.stack || e.message}`); }
     }
     await sleep(60000);
@@ -817,6 +939,14 @@ Step 4 — alerts (optional, but recommended)
   cfg.deviceAutoUpdate = cfg.sensors.some((x) => x.statusUrl)
     ? await askYesNo(rl, '  Install Air!Squitter software updates automatically?', old.deviceAutoUpdate === true)
     : old.deviceAutoUpdate === true;
+  if (cfg.sensors.some((x) => x.statusUrl)) {
+    console.log('\nUnofficial community fixes (off unless you turn them on)');
+    console.log('  These are small fixes written by the Sensor Keeper community, NOT by jetvision or 4DSKY.');
+    console.log('  Each is installed only on a sensor that shows the exact problem it fixes, and only once.');
+    console.log('  Available now:');
+    for (const f of COMMUNITY_FIXES) console.log(`   - ${f.title}\n     ${f.description.replace(/(.{1,90})(\s|$)/g, '$1\n     ').trimEnd()}`);
+    cfg.communityFixes = await askYesNo(rl, '  Install unofficial community fixes automatically when needed?', old.communityFixes === true);
+  }
 
   writePrivate(CONFIG, cfg);
   console.log(`\nSaved to ${CONFIG}\n`);
@@ -1175,6 +1305,7 @@ async function runUi() {
           config: publicConfig(cfg), sensors, service: serviceInfo(), autoLogout: autoLogoutOn(),
           lastRun: st.lastRun || null, faucetUsed: faucetUsed24h(st), faucetLimit: FAUCET_DAILY_LIMIT,
           topups: topupSummary(), home: HOME,
+          fixes: COMMUNITY_FIXES.map((f) => ({ id: f.id, title: f.title, description: f.description })),
         });
       }
       if (api === 'activity') return send(res, 200, { items: readActivity(parseInt(url.searchParams.get('n') || '300', 10)) });
@@ -1228,6 +1359,7 @@ async function runUi() {
         next.weeklySummary = !!b.weeklySummary;
         if (typeof b.autoUpdate === 'boolean') next.autoUpdate = b.autoUpdate;
         if (typeof b.deviceAutoUpdate === 'boolean') next.deviceAutoUpdate = b.deviceAutoUpdate;
+        if (typeof b.communityFixes === 'boolean') next.communityFixes = b.communityFixes;
         writePrivate(CONFIG, next);
         log('settings saved from the app');
         return send(res, 200, { ok: true, config: publicConfig(next) });
@@ -1404,7 +1536,10 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
     <div class="warnbox">The topic name works like a password — anyone who knows it can read your alerts. Use something unique.</div>
     <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:14px"><input type="checkbox" id="weekly"> Send a weekly "all good" summary</label>
     <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="autoupd"> Keep Sensor Keeper up to date automatically</label>
-    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="devupd"> Install Air!Squitter software updates automatically</label></div>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="devupd"> Install Air!Squitter software updates automatically</label>
+    <label style="display:flex;gap:8px;align-items:center;color:var(--ink);margin-top:10px"><input type="checkbox" id="cfix"> Install <b>unofficial</b> community fixes when a sensor needs one</label>
+    <p class="help" style="margin-top:4px">Written by the Sensor Keeper community, not by jetvision or 4DSKY. Each fix is installed only on a sensor that shows the exact problem it fixes, and only once. You're told before and after.</p>
+    <div id="fixList" class="help"></div></div>
 
   <div class="card"><h2>5. Run in the background</h2>
     <p class="help" id="svcHelp">Sensor Keeper keeps watch in the background and starts automatically.</p>
@@ -1454,13 +1589,13 @@ function renderSettings(){var c=S.config;var L=$('sensorList');L.innerHTML='';(S
   $('token').value='';$('token').placeholder=c.tokenSet?'Saved ('+c.tokenHint+') — paste a new one only to replace it':'Paste your Personal Access Token';
   $('tokenNote').className='note '+(c.tokenSet?'ok':'warn');$('tokenNote').textContent=c.tokenSet?'A token is saved.':'No token saved yet — top-ups can\'t run without it.';
   $('lowWater').value=c.lowWater;$('topupAmount').value=c.topupAmount;$('checkEvery').value=c.checkEveryMinutes;
-  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate===true;$('devupd').checked=c.deviceAutoUpdate===true;dirty=false;$('saveNote').textContent='';}
+  $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate===true;$('devupd').checked=c.deviceAutoUpdate===true;$('cfix').checked=c.communityFixes===true;$('fixList').innerHTML=(S.fixes||[]).map(function(f){return '<details style="margin:6px 0"><summary><b>'+esc(f.title)+'</b></summary><div style="margin-top:4px">'+esc(f.description)+'</div></details>';}).join('');dirty=false;$('saveNote').textContent='';}
 function markDirty(){dirty=true;$('saveNote').textContent='Unsaved changes';}
-['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
+['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd','cfix'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
 $('addSensor').onclick=function(){$('sensorList').appendChild(sensorRow({id:'',name:'',statusUrl:''}));markDirty();};
 $('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-';for(var i=0;i<10;i++)r+=a[Math.floor(Math.random()*a.length)];$('ntfy').value=r;markDirty();};
 $('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim(),devicePassword:d.querySelector('.spw').value,clearPassword:!!(d.querySelector('.spwreset')&&d.querySelector('.spwreset').checked)});});
-  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked})
+  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked,communityFixes:$('cfix').checked})
   .then(function(){toast(S.service.running?'Saved. The background service picks up the changes within a minute.':'Saved. Now start the background service (step 5).');return refresh(true);}).catch(function(e){toast(e.message,9000);$('saveNote').textContent=e.message;}).then(function(){b.disabled=false;});};
 function svc(action){var btns=[$('svcStart'),$('svcStop')];btns.forEach(function(x){x.disabled=true;});$('svcNote').textContent=action==='install'?'Starting…'+(S.platform==='darwin'&&$('always').checked?' (enter your Mac password in the dialog)':''):'Stopping…';
   api('service',{action:action,always:$('always').checked}).then(function(){toast(action==='install'?'Background service started.':'Background service stopped.');return refresh();}).catch(function(e){toast(e.message,9000);$('svcNote').textContent=e.message;}).then(function(){btns.forEach(function(x){x.disabled=false;});});}
@@ -1505,6 +1640,8 @@ Usage: ${APP} <command>
   uninstall-service   Stop and remove the background service
   update              Install the latest Sensor Keeper now (it also does this by itself)
   update-sensors      Check for and install Air!Squitter software updates now
+  fixes               List unofficial community fixes and whether your sensors need them
+  apply-fix <id>      Install a community fix now (only if the sensor shows the problem)
   logs                Show the last 40 log lines
   version             Print the version
 
@@ -1543,6 +1680,28 @@ async function main() {
     case 'uninstall-service': return uninstallService();
     case 'logs': { try { console.log(fs.readFileSync(LOG, 'utf8').trim().split('\n').slice(-40).join('\n')); } catch { console.log('No log yet.'); } return; }
     case 'version': case '--version': case '-v': console.log(VERSION); return;
+    case 'fixes': {
+      console.log('Unofficial community fixes (not from jetvision or 4DSKY). Turn on automatic install in Settings,');
+      console.log(`or install one by hand with: ${APP} apply-fix <id>\n`);
+      const c = loadConfig(); const st = loadState();
+      for (const f of COMMUNITY_FIXES) {
+        console.log(`${f.id}: ${f.title}\n  ${f.description}`);
+        for (const s2 of ((c && c.sensors) || []).filter((x) => x.statusUrl)) {
+          const fx = ((st.sensors[s2.id] || {}).fixes || {})[f.id];
+          console.log(`  ${s2.name || s2.id}: ${fx ? fx.result : 'not checked yet'}`);
+        }
+        console.log('');
+      }
+      return;
+    }
+    case 'apply-fix': {
+      const c = needCfg();
+      const fix = COMMUNITY_FIXES.find((f) => f.id === argv[1]);
+      if (!fix) { console.error(`Usage: ${APP} apply-fix <id>   (see "${APP} fixes")`); process.exit(1); }
+      const res = await communityFixesAll(c, { force: true, only: fix.id });
+      res.forEach((r) => console.log(`${r.sensor.name || r.sensor.id}: ${r.result}`));
+      return;
+    }
     case 'update-sensors': {
       const c = needCfg();
       if (!c.sensors.some((x) => x.statusUrl)) { console.log(`No Air!Squitter status page is set up. Run "${APP} setup" to add one.`); return; }
