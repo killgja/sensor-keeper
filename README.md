@@ -36,6 +36,14 @@ account that pays for the sensor's heartbeats, not your wallet or rewards accoun
 the 4DSKY app and in your sensor's Neuron setup; on hashscan.io it's the account with a steady
 stream of "consensus submit message" transactions.
 
+**Jetvision Air!Squitter owners:** also have your sensor's **IP address** on your network ready, and make
+sure it's **fixed** (never changes). Every network is different, so use *your* sensor's address — find it in
+your router's list of connected devices (often named `air-squitter`), or try `air-squitter.local`. To fix it,
+set a **DHCP reservation** ("fixed IP" / "static lease") for the air-squitter in your router, or set a static IP
+on the sensor (Settings → Network) if you know your network's netmask, gateway and DNS. Sensor Keeper uses
+this address for health checks, diagnosis, updates and fixes; if it changes, Sensor Keeper loses track of the
+sensor until you update it. Without it, top-ups and heartbeat alerts still work.
+
 ## Install
 
 ### Easiest: double-click
@@ -154,8 +162,7 @@ installs one by hand.
 
 When a sensor stops sending heartbeats, Sensor Keeper works out why and alerts you once per cause with what
 to do (also `sensor-keeper diagnose`): sensor unreachable on your network (power/cable/Wi-Fi), no internet,
-DNS broken, **a static gateway outside the sensor's own network** (e.g. 1.1.1.1 — it can reach your house but
-not the internet), 4DSKY program not sending heartbeats although the internet works, or 4DSKY program waiting for setup. Sensor Keeper never changes
+DNS broken, 4DSKY program not sending heartbeats although the internet works, or 4DSKY program waiting for setup. Sensor Keeper never changes
 the sensor's network settings itself: a wrong guess there could take the sensor off your network until someone
 fixes it by hand.
 

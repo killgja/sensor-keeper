@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -605,25 +605,6 @@ async function tryHttp(url, opts = {}, ms = 8000) {
   try { return await http(url, opts, ms); } catch (e) { return { ok: false, status: 0, json: null, text: '', error: e.message }; }
 }
 const neuronBase = (statusUrl) => devBase(statusUrl).replace(/:\d+$/, '') + `:${NEURON_PORT}`;
-const ipNum = (ip) => String(ip).split('.').reduce((a, o) => (a * 256) + (parseInt(o, 10) || 0), 0) >>> 0;
-const sameSubnet = (a, b, mask) => ((ipNum(a) & ipNum(mask)) >>> 0) === ((ipNum(b) & ipNum(mask)) >>> 0);
-
-// Static network settings as shown on the sensor's Network page (needs login).
-async function deviceNetwork(statusUrl, cookie) {
-  const r = await http(`${devBase(statusUrl)}/network.html`, { headers: { Cookie: cookie } }, 15000);
-  const forms = (r.text || '').split(/<form\b/i).slice(1).map((f) => f.split(/<\/form>/i)[0]);
-  const out = [];
-  for (const f of forms) {
-    const val = (name) => ((f.match(new RegExp(`<input[^>]*name="${name}"[^>]*>`, 'i')) || [''])[0].match(/value="([^"]*)"/) || [])[1] || '';
-    const dhcpChecked = (f.match(/<input[^>]*name="dhcp"[^>]*>/gi) || []).find((x) => /checked/i.test(x));
-    const dhcp = dhcpChecked ? (dhcpChecked.match(/value="([^"]*)"/) || [])[1] : null;
-    const ip = val('ipaddress');
-    if (dhcp === null && !ip) continue;
-    out.push({ wifi: /wifimode|ssid/i.test(f), dhcp: dhcp === '1', ip, netmask: val('ipnetmask'), gateway: val('ipgateway'), dns: val('ipdns') });
-  }
-  return out;
-}
-
 // Does a validating public resolver (Cloudflare) accept stun.voipgate.com again?
 async function voipgateDnssecHealthy() {
   const r = await tryHttp((process.env.SENSOR_KEEPER_DOH || 'https://cloudflare-dns.com/dns-query') + '?name=stun.voipgate.com&type=A', { headers: { Accept: 'application/dns-json' } }, 10000);
@@ -636,7 +617,8 @@ async function diagnoseSensor(cfg, sensor, { heartbeatAgeMin = null } = {}) {
   const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
   if (!st.json) {
     add('lan', 'bad', `The sensor doesn't answer on your network (${sensor.statusUrl}).`,
-      'Check that it has power (lights on), and its network cable or Wi-Fi. If it was just restarted, give it 5 minutes.');
+      'Check that it has power (lights on), and its network cable or Wi-Fi. If it was just restarted, give it 5 minutes. ' +
+      "If its address changed, give it a fixed address (see Sensor Keeper's setup) and update it in Sensor Keeper's Settings.");
     return f;
   }
   add('lan', 'ok', 'The sensor answers on your network.');
@@ -648,20 +630,7 @@ async function diagnoseSensor(cfg, sensor, { heartbeatAgeMin = null } = {}) {
   else if (dnsBroken) add('dns', 'bad', "It can't look up internet names (DNS), so MLAT and 4DSKY heartbeats stop.",
     'Turn on "Install unofficial community fixes" in Sensor Keeper (DNS fix), or install jv-ksk2024-fix from the Sensor Keeper GitHub through the sensor\'s Software Maintenance → Upload and Install page.');
   else add('internet', 'bad', `MLAT isn't connected (${mlat.desc || mlat.status || 'unknown'}). The sensor probably can't reach the internet.`,
-    "Check the sensor's network settings (gateway and DNS) and your router.");
-
-  // Network settings sanity (needs the admin password; skipped if login fails).
-  try {
-    const cookie = await deviceLogin(sensor.statusUrl, devicePw(sensor));
-    for (const n of await deviceNetwork(sensor.statusUrl, cookie)) {
-      if (n.dhcp || !n.ip || !n.gateway) continue;
-      const kind = n.wifi ? 'Wi-Fi' : 'wired';
-      if (n.netmask && !sameSubnet(n.ip, n.gateway, n.netmask)) {
-        add('gateway', 'bad', `Its ${kind} default gateway is ${n.gateway}, which isn't on its own network (${n.ip}/${n.netmask}). It can talk to your house but not the internet.`,
-          `On the sensor's Settings → Network page, set the ${kind} Default Gateway to your router's address (usually the network's .1 address, e.g. ${n.ip.split('.').slice(0, 3).join('.')}.1), or switch to Automatic (DHCP). Save and reboot.`);
-      } else add('gateway', 'ok', `${kind} settings look sane (gateway ${n.gateway}).`);
-    }
-  } catch (e) { add('settings', 'warn', `Couldn't read its network settings (${e.message}).`); }
+    "Check that your router is online and that the sensor's network settings match your network (Automatic/DHCP is simplest).");
 
   // The 4DSKY (Neuron) program that sends heartbeats. Its page on port 1337 is only open
   // while it waits for setup; once running it closes, so heartbeats are the real signal.
@@ -680,7 +649,7 @@ async function diagnoseSensor(cfg, sensor, { heartbeatAgeMin = null } = {}) {
   return f;
 }
 // After each check: for sensors in trouble, find out why and alert once per cause, with what to do.
-const DIAG_KEYS = { dns: 'DNS is broken', internet: "can't reach the internet", gateway: 'wrong gateway setting', neuron: '4DSKY program not running', 'neuron-setup': '4DSKY program needs setup' };
+const DIAG_KEYS = { dns: 'DNS is broken', internet: "can't reach the internet", neuron: '4DSKY program not running', 'neuron-setup': '4DSKY program needs setup' };
 async function diagnoseAll(cfg, results) {
   const state = loadState();
   for (const r of results) {
@@ -1099,15 +1068,34 @@ Nothing here uses real money: testnet HBAR is free and has no value.
     } catch (e) { console.log(`couldn't reach the mirror node (${e.message}); saving anyway.`); }
     const name = await ask(rl, '  A nickname for it (optional)', prev ? prev.name || '' : '');
     let statusUrl = '';
-    if (await askYesNo(rl, '  Is it a Jetvision Air!Squitter I can reach on this network (to check its status page)?', !!(prev && prev.statusUrl))) {
-      statusUrl = await ask(rl, '  Its address, e.g. http://192.168.1.50', prev ? prev.statusUrl || '' : '');
-      if (statusUrl && !/^https?:\/\//.test(statusUrl)) statusUrl = 'http://' + statusUrl;
-      if (statusUrl) {
-        process.stdout.write('  Testing… ');
-        try { const d = await getDeviceStatus(statusUrl); console.log(d.bad.length ? `reachable, reports: ${d.bad.join('; ')}` : 'reachable, all green.'); }
-        catch (e) { console.log(`not reachable right now (${e.message}); saving anyway.`); }
+    console.log(`
+  Is this sensor a Jetvision Air!Squitter on the same network as this computer? If so, give me
+  its IP address. Sensor Keeper uses it to check the sensor's health, explain problems, install
+  updates and fixes. Everyone's network is different, so enter YOUR sensor's address — find it in
+  your router's list of connected devices (often named "air-squitter"), or try air-squitter.local.
+
+  IMPORTANT: the address must be FIXED (never change). Set this up first, either way:
+    • in your router: "DHCP reservation" / "fixed IP" / "static lease" for the air-squitter, or
+    • on the sensor: Settings → Network → Manual (Static IP) — only if you know your network's
+      correct netmask, gateway and DNS.
+  If the address changes later, Sensor Keeper loses track of the sensor until you update it here.
+  Leave blank (Enter) if it isn't an Air!Squitter or isn't on this network — balance top-ups and
+  heartbeat alerts still work without it.`);
+    for (;;) {
+      const prevIp = prev && prev.statusUrl ? prev.statusUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
+      const a = (await ask(rl, '  Air!Squitter IP address (e.g. 192.168.1.50, Enter to skip)', prevIp)).replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      if (!a) break;
+      if (!/^(\d{1,3}\.){3}\d{1,3}(:\d+)?$/.test(a) && !/^[a-z0-9.-]+(:\d+)?$/i.test(a)) { console.log("  That doesn't look like an IP address. Try again, or press Enter to skip."); continue; }
+      statusUrl = 'http://' + a;
+      process.stdout.write('  Testing… ');
+      try { const d = await getDeviceStatus(statusUrl); console.log(d.bad.length ? `found your Air!Squitter; it reports: ${d.bad.join('; ')}` : 'found your Air!Squitter, all green.'); break; }
+      catch (e) {
+        console.log(`no Air!Squitter answered at ${a} (${e.message}).`);
+        if (await askYesNo(rl, '  Save it anyway?', false)) break;
+        statusUrl = '';
       }
     }
+    if (statusUrl) console.log('  ✓ Saved. Remember: make sure this address is fixed in your router or on the sensor.');
     let devicePassword = '';
     if (statusUrl) {
       console.log('  Sensor Keeper also installs Air!Squitter software updates for you (it does what');
@@ -1762,6 +1750,7 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
 <section id="tab-settings" class="hidden">
   <div class="card"><h2>1. Your sensor(s)</h2>
     <p class="help">Enter each sensor's own Hedera <b>device account ID</b> (looks like 0.0.1234567) — the account that pays for its heartbeats, not your wallet or rewards account. It's in the 4DSKY app and your sensor's Neuron setup.</p>
+    <p class="help"><b>Air!Squitter IP address:</b> enter <i>your</i> sensor's address on your network (every network is different — find it in your router's list of connected devices, often named "air-squitter", or try air-squitter.local). Sensor Keeper uses it to check the sensor's health, explain problems, and install updates and fixes. <b>The address must be fixed</b>: set a "DHCP reservation" / "fixed IP" for the air-squitter in your router (or a static IP on the sensor if you know your network's settings). If it changes, Sensor Keeper loses track of the sensor until you update it here. Leave it blank if your sensor isn't an Air!Squitter on this network — top-ups and heartbeat alerts still work.</p>
     <div id="sensorList"></div><button class="btn" id="addSensor">+ Add another sensor</button></div>
 
   <div class="card"><h2>2. Hedera Portal access token</h2>
@@ -1832,7 +1821,7 @@ function renderStatus(){
   document.querySelectorAll('[data-topup]').forEach(function(b){b.onclick=function(){if(!confirm('Request a top-up for '+b.dataset.topup+' now? It uses part of your daily 100 HBAR faucet allowance.'))return;b.disabled=true;api('topup',{id:b.dataset.topup}).then(function(r){toast(r.result,8000);refresh();}).catch(function(e){toast(e.message,8000);}).then(function(){b.disabled=false;});};});
   var t=S.topups;$('stCount').textContent=t.count;$('stTotal').textContent=t.total.toLocaleString();$('stLast').textContent=t.last?local(t.last):'never';$('stFaucet').textContent=S.faucetUsed+' / '+S.faucetLimit;}
 function sensorRow(s){var d=document.createElement('div');d.className='sensor';
-  d.innerHTML='<div class="row"><div><label>Account ID</label><input type="text" class="sid" placeholder="0.0.1234567" value="'+esc(s.id)+'"></div><div><label>Nickname (optional)</label><input type="text" class="sname" value="'+esc(s.name)+'"></div><div><label>Jetvision status page on your network (optional)</label><input type="text" class="surl" placeholder="http://192.168.1.50" value="'+esc(s.statusUrl)+'"></div><div><label>Air!Squitter admin password</label><input type="password" class="spw" autocomplete="new-password" placeholder="'+(s.devicePasswordSet?'your saved password — type to change':'factory default — type to change')+'">'+(s.devicePasswordSet?'<label class="note" style="display:flex;gap:6px;align-items:center;margin-top:4px"><input type="checkbox" class="spwreset"> use factory default</label>':'')+'</div><div class="actions"><button class="btn small chk">Check</button><button class="btn small rm" title="Remove">Remove</button></div></div><div class="note res"></div>';
+  d.innerHTML='<div class="row"><div><label>Account ID</label><input type="text" class="sid" placeholder="0.0.1234567" value="'+esc(s.id)+'"></div><div><label>Nickname (optional)</label><input type="text" class="sname" value="'+esc(s.name)+'"></div><div><label>Air!Squitter IP address — must be fixed (optional)</label><input type="text" class="surl" placeholder="your sensor\'s IP, e.g. 192.168.1.50" value="'+esc(s.statusUrl)+'"></div><div><label>Air!Squitter admin password</label><input type="password" class="spw" autocomplete="new-password" placeholder="'+(s.devicePasswordSet?'your saved password — type to change':'factory default — type to change')+'">'+(s.devicePasswordSet?'<label class="note" style="display:flex;gap:6px;align-items:center;margin-top:4px"><input type="checkbox" class="spwreset"> use factory default</label>':'')+'</div><div class="actions"><button class="btn small chk">Check</button><button class="btn small rm" title="Remove">Remove</button></div></div><div class="note res"></div>';
   d.querySelector('.rm').onclick=function(){d.remove();markDirty();};
   d.querySelector('.chk').onclick=function(){var r=d.querySelector('.res');r.className='note';r.textContent='Checking Hedera…';api('check-sensor',{id:d.querySelector('.sid').value.trim(),statusUrl:d.querySelector('.surl').value.trim()}).then(function(j){if(!j.ok){r.className='note bad';r.textContent=j.message;return;}
     r.className='note '+(j.warning?'warn':'ok');r.textContent='Found — '+j.balance.toFixed(2)+' HBAR'+(j.heartbeatAgeMin!=null?', last heartbeat '+j.heartbeatAgeMin.toFixed(1)+' min ago':'')+(j.device?'; status page: '+j.device:'')+(j.warning?'. '+j.warning:'.');}).catch(function(e){r.className='note bad';r.textContent=e.message;});};
