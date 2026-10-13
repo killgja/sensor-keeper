@@ -1,0 +1,65 @@
+#!/bin/sh
+# Same changes as Jetvision's buster-archive-fix 4.0, minus the dpkg/apt calls that
+# cannot run inside an install. Those are scheduled to run after the install ends.
+set +e
+LOG=/var/log/jv-buster-archive-fix-complete.log
+say() { echo "jv-buster-archive-fix-complete: $*"; echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+[ "$1" = configure ] || exit 0
+
+# 1. DNSSEC trust anchor KSK-2024 (keep what's there if it already has it)
+mkdir -p /etc/dnssec-trust-anchors.d
+if grep -qs 38696 /etc/dnssec-trust-anchors.d/root.positive; then
+  say "KSK-2024 trust anchor already present"
+else
+  echo ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16" > /etc/dnssec-trust-anchors.d/root.positive
+  say "added KSK-2024 trust anchor"
+fi
+
+# 2. APT sources: deb.debian.org -> archive.debian.org for buster lines
+if [ -f /etc/apt/sources.list ] && grep -q 'buster' /etc/apt/sources.list && grep -q 'deb.debian.org' /etc/apt/sources.list; then
+  sed -i '/buster/ s|deb.debian.org|archive.debian.org|g' /etc/apt/sources.list && say "sources.list now uses archive.debian.org"
+else
+  say "sources.list already OK"
+fi
+
+# 4. systemd-resolved settings (same values as Jetvision's patch)
+if [ -f /etc/systemd/resolved.conf ]; then
+  CONF=/etc/systemd/resolved.conf
+  for opt in "FallbackDNS=1.1.1.1 1.0.0.1 8.8.8.8" "DNSSEC=allow-downgrade" "DNSOverTLS=opportunistic"; do
+    key=${opt%%=*}
+    if grep -qE "^[#]*$key=" "$CONF"; then sed -i "s|^[#]*$key=.*|$opt|" "$CONF"; else echo "$opt" >> "$CONF"; fi
+  done
+  say "resolved.conf: FallbackDNS, DNSSEC=allow-downgrade, DNSOverTLS=opportunistic"
+fi
+systemctl daemon-reload 2>/dev/null
+systemctl restart systemd-resolved 2>/dev/null && say "restarted systemd-resolved"
+resolvectl flush-caches 2>/dev/null || systemd-resolve --flush-caches 2>/dev/null
+
+# 5. /etc/fixtime.conf paths
+FIXTIMECONF=/etc/fixtime.conf
+touch "$FIXTIMECONF"
+for path in /var/lib/systemd /var/log /root /root/.crt /root/ranges; do
+  grep -qxF "$path" "$FIXTIMECONF" || echo "$path" >> "$FIXTIMECONF"
+done
+say "fixtime.conf paths present"
+
+# 3 + postinst of the original: run AFTER this install finishes (dpkg is locked now)
+if command -v systemd-run >/dev/null 2>&1; then
+  systemctl stop jv-buster-followup.timer jv-buster-followup.service 2>/dev/null
+  systemctl reset-failed jv-buster-followup.service 2>/dev/null
+  systemd-run --on-active=90 --unit=jv-buster-followup --description="Finish buster-archive-fix: repair + update + upgrade" \
+    /bin/sh -c "export DEBIAN_FRONTEND=noninteractive; { echo \"=== \$(date -u +%FT%TZ) follow-up start\"; \
+      dpkg --configure -a; apt-get -f -y install; apt-get update; \
+      apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade; \
+      echo \"=== \$(date -u +%FT%TZ) follow-up done (exit \$?)\"; } >> $LOG 2>&1" >/dev/null 2>&1 \
+    && { SCHED=1; say "scheduled package repair + apt update + apt upgrade to start in 90 seconds (log: $LOG)"; } \
+    || say "could not schedule the follow-up; run 'apt-get update && apt-get upgrade' later"
+fi
+
+# result
+for h in mlat.jetvision.de stun.voipgate.com testnet.mirrornode.hedera.com; do
+  getent hosts "$h" >/dev/null 2>&1 && R="$R $h=OK" || R="$R $h=FAILED"
+done
+say "DNS check:$R"
+if [ -n "$SCHED" ]; then say "done. Leave the sensor powered on for ~10 minutes while updates install, then reboot."; else say "done."; fi
+exit 0

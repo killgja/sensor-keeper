@@ -1,5 +1,9 @@
 # jv-ksk2024-fix — DNS fix for Jetvision Air!Squitter / Radarcape (unofficial)
 
+> **Update 13 Oct 2026:** Jetvision has released an official patch (`patch-rcd-asq-0004.ddeb`,
+> buster-archive-fix 4.0). Use it. If its install ends with "dpkg database lock is locked", the DNS
+> key part still applied; install [`buster-archive-fix-complete/`](buster-archive-fix-complete/) to finish the rest.
+
 On 11 Oct 2026 the DNS root key changed from KSK-2017 (tag 20326) to KSK-2024 (tag 38696).
 Sensors whose local validating resolver only trusts the old key fail every name lookup
 (MLAT "Host not found", no 4DSKY heartbeats).

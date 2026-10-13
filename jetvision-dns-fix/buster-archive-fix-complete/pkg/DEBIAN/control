@@ -1,0 +1,12 @@
+Package: jv-buster-archive-fix-complete
+Version: 1.0.0
+Architecture: all
+Maintainer: Sensor Keeper community <killgja@users.noreply.github.com>
+Priority: optional
+Section: admin
+Description: Finish Jetvision's buster-archive-fix 4.0 (patch-rcd-asq-0004) safely
+ Jetvision's patch stops with "dpkg database lock is locked" because it runs
+ dpkg/apt from inside its own install. This package applies the same changes
+ (KSK-2024 trust anchor, archive.debian.org sources, FallbackDNS, DNSOverTLS,
+ fixtime.conf paths) and schedules the package repair + apt update/upgrade to
+ run 90 seconds AFTER the install has finished. Unofficial; Debian 10 only.

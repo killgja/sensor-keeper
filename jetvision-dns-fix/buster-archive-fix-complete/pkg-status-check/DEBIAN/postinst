@@ -1,0 +1,14 @@
+#!/bin/sh
+set +e
+[ "$1" = configure ] || exit 0
+echo "=== $(date -u) uptime: $(uptime)"
+echo "=== follow-up unit"; systemctl status jv-buster-followup.service jv-buster-followup.timer --no-pager 2>&1 | head -20
+echo "=== log"; tail -n 60 /var/log/jv-buster-archive-fix-complete.log 2>&1
+echo "=== package states"; dpkg -l | grep -Ei 'buster-archive|jv-|neuron|radarcape|rcd' 2>&1
+echo "=== not fully installed"; dpkg -l | awk 'NR>5 && $1!="ii"' | grep -v jv-status-check
+echo "=== audit"; dpkg --audit 2>&1 | head -20
+echo "=== upgradable"; apt list --upgradable 2>/dev/null | head -20
+echo "=== resolved.conf"; grep -E '^(DNS|FallbackDNS|DNSSEC|DNSOverTLS)=' /etc/systemd/resolved.conf
+echo "=== anchors"; cat /etc/dnssec-trust-anchors.d/root.positive 2>&1
+echo "=== neuron"; systemctl is-active neuron-sdk 2>&1; systemctl list-units --no-pager 2>/dev/null | grep -i neuron
+exit 0

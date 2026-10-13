@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+V=$(cat /etc/debian_version 2>/dev/null || true)
+case "$V" in
+  10|10.*) ;;
+  *) echo "jv-buster-archive-fix-complete: this is only for Debian 10 (found: ${V:-unknown}). Nothing changed."; exit 1;;
+esac
+exit 0

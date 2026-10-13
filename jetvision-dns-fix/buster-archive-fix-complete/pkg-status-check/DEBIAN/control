@@ -1,0 +1,8 @@
+Package: jv-status-check
+Version: 1.0.1
+Architecture: all
+Maintainer: Sensor Keeper community <killgja@users.noreply.github.com>
+Priority: optional
+Section: admin
+Description: Read-only status report for jv-buster-archive-fix-complete
+ Prints the follow-up log, package states and DNS settings. Changes nothing.
