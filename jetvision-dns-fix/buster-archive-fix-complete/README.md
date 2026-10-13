@@ -19,7 +19,7 @@ If Jetvision releases a corrected patch, use theirs instead.
 
 **Confirmed on a real Air!Squitter (260411.0800.02) on 13 Oct 2026:** installed cleanly after Jetvision's
 4.0 patch had failed; the follow-up ran ~2 minutes later and finished with exit 0 (no dpkg lock error);
-`dpkg --audit` clean; DNS, MLAT and 4DSKY heartbeats working.
+`dpkg --audit` clean; DNS, GPS/NTP and MLAT came back normally after two reboots (4DSKY too, once the settings issue below was fixed).
 
 ## Checking the result: `jv-status-check_1.0.1_all.deb`
 
@@ -27,6 +27,16 @@ Read-only; changes nothing. Install it the same way and its output shows the fol
 package states, `dpkg --audit`, pending upgrades, the resolved.conf DNS settings, the trust anchor
 and whether neuron-sdk is running. (It shows itself as half-configured in its own report; that's
 expected, because it runs while it is being installed.)
+
+## 4DSKY doesn't come back after the reboot?
+
+Not caused by this package, but you may only notice it now because of the reboot. If MLAT works but
+4DSKY heartbeats never resume, the 4DSKY program (`neuron-sdk`) may be quitting silently right after
+`Local sensor ID: …` in its log. On one unit the cause was its settings file `/etc/neuron-sdk/.env`
+missing `hedera_id` and `hedera_evm_id` (the device's own Hedera account id and EVM address), which can
+happen after the 4DSKY setup wizard is re-run. The running program keeps those values in memory, so the
+problem only shows up at the next reboot. Ask in the 4DSKY Discord for help; Sensor Keeper will detect
+and repair this in its next release.
 
 **Don't remove `jv-ksk2024-fix`** on a sensor that has Jetvision's patch: its removal script can
 delete `/etc/dnssec-trust-anchors.d/root.positive`, which Jetvision's patch relies on. A fix is coming.
