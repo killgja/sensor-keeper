@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -264,7 +264,10 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
       st.statusFails = 0;
       out.deviceIssues = ds.bad;
       await problem(cfg, st, 'device-down', false, `Sensor Keeper: ${label} status page unreachable`, '');
-      await problem(cfg, st, 'device-status', ds.bad.length > 0, `Sensor Keeper: ${label} reports a problem`, ds.bad.join('\n'));
+      // MLAT may be off/unregistered on some sensors: ignore MLAT-only complaints while heartbeats are fine.
+      const hbOk = out.heartbeatAgeMin != null && out.heartbeatAgeMin <= cfg.heartbeatAlertMinutes;
+      const issues = hbOk ? ds.bad.filter((x) => !/^mlat/i.test(x)) : ds.bad;
+      await problem(cfg, st, 'device-status', issues.length > 0, `Sensor Keeper: ${label} reports a problem`, issues.join('\n'));
     } catch (e) {
       st.statusFails = (st.statusFails || 0) + 1;
       out.deviceIssues = [`status page: ${e.message}`];
@@ -611,35 +614,54 @@ async function voipgateDnssecHealthy() {
   return !!(r.json && r.json.Status === 0 && Array.isArray(r.json.Answer) && r.json.Answer.length);
 }
 
+// The sensor's internet/DNS state, judged from its MLAT client. MLAT may be turned off or not
+// registered on some sensors, so "not connected" is only treated as an internet problem when
+// MLAT is actually trying (and failing), and unknown otherwise.
+async function sensorNet(sensor) {
+  const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
+  if (!st.json) return { state: 'unreachable' };
+  const m = st.json.mlat || {};
+  const ml = await tryHttp(`${devBase(sensor.statusUrl)}/mlatstatus.json`);
+  const connlog = (ml.json && ml.json.mlat && ml.json.mlat.connlog) || '';
+  if (m.status === 'green') return { state: 'ok', desc: m.desc };
+  if (/resolve: Host not found/i.test(connlog)) return { state: 'dns', desc: m.desc };
+  if (!m.status || m.status === 'unknown' || /disabled|not enabled|not configured|not registered|licen[cs]e|blocked/i.test(`${m.desc || ''} ${connlog.slice(-500)}`)) return { state: 'unknown', desc: m.desc || 'MLAT off' };
+  return { state: 'down', desc: m.desc || m.status };
+}
+
 async function diagnoseSensor(cfg, sensor, { heartbeatAgeMin = null } = {}) {
   const f = [];   // { key, level: ok|warn|bad, text, fix }
   const add = (key, level, text, fix = '') => f.push({ key, level, text, fix });
-  const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
-  if (!st.json) {
-    add('lan', 'bad', `The sensor doesn't answer on your network (${sensor.statusUrl}).`,
+  const net = await sensorNet(sensor);
+  const stale = heartbeatAgeMin == null || heartbeatAgeMin > (cfg.heartbeatAlertMinutes || 15);
+  if (net.state === 'unreachable') {
+    add('lan', 'bad', `The sensor doesn't answer at ${sensor.statusUrl} from this computer.`,
       'Check that it has power (lights on), and its network cable or Wi-Fi. If it was just restarted, give it 5 minutes. ' +
-      "If its address changed, give it a fixed address (see Sensor Keeper's setup) and update it in Sensor Keeper's Settings.");
+      "If its address changed, give it a fixed address and update it in Sensor Keeper's Settings. If this sensor is at a " +
+      "different location (another home or network), Sensor Keeper can only check it from a computer on that network: remove its IP here " +
+      '(top-ups and heartbeat alerts still work from anywhere), or install Sensor Keeper at that location too.');
     return f;
   }
   add('lan', 'ok', 'The sensor answers on your network.');
-  const mlat = st.json.mlat || {};
-  const ml = await tryHttp(`${devBase(sensor.statusUrl)}/mlatstatus.json`);
-  const connlog = (ml.json && ml.json.mlat && ml.json.mlat.connlog) || '';
-  const dnsBroken = /resolve: Host not found/i.test(connlog);
-  if (mlat.status === 'green') add('internet', 'ok', 'It reaches the internet and can look up names (MLAT connected).');
-  else if (dnsBroken) add('dns', 'bad', "It can't look up internet names (DNS), so MLAT and 4DSKY heartbeats stop.",
+  if (net.state === 'ok') add('internet', 'ok', 'It reaches the internet and can look up names (MLAT connected).');
+  else if (net.state === 'dns') add('dns', 'bad', "It can't look up internet names (DNS), so MLAT and 4DSKY heartbeats stop.",
     'Turn on "Install unofficial community fixes" in Sensor Keeper (DNS fix), or install jv-ksk2024-fix from the Sensor Keeper GitHub through the sensor\'s Software Maintenance → Upload and Install page.');
-  else add('internet', 'bad', `MLAT isn't connected (${mlat.desc || mlat.status || 'unknown'}). The sensor probably can't reach the internet.`,
+  else if (net.state === 'unknown') add('internet', stale ? 'warn' : 'ok', stale
+    ? "Can't tell whether the sensor reaches the internet (its MLAT is off or not registered, which is what Sensor Keeper uses to check)."
+    : 'MLAT is off or not registered on this sensor, but heartbeats show its internet works.');
+  else if (!stale) add('internet', 'ok', `MLAT isn't connected (${net.desc}), but heartbeats show the sensor's internet works.`);
+  else add('internet', 'bad', `MLAT isn't connected (${net.desc}) and heartbeats have stopped. The sensor probably can't reach the internet.`,
     "Check that your router is online and that the sensor's network settings match your network (Automatic/DHCP is simplest).");
 
   // The 4DSKY (Neuron) program that sends heartbeats. Its page on port 1337 is only open
   // while it waits for setup; once running it closes, so heartbeats are the real signal.
   const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 6000);
-  const stale = heartbeatAgeMin == null || heartbeatAgeMin > (cfg.heartbeatAlertMinutes || 15);
   if (nr.ok && /start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text)) add('neuron-setup', 'warn', 'The 4DSKY program is running but waiting for setup.',
     `Open ${neuronBase(sensor.statusUrl)} and complete the setup wizard (device account ID and the device's private key).`);
   else if (!stale) add('neuron', 'ok', 'The 4DSKY program is sending heartbeats.');
-  else if (mlat.status === 'green') add('neuron', 'bad', "The sensor's internet works, but the 4DSKY program isn't sending heartbeats — it has probably crashed or is missing.",
+  else if (net.state === 'ok' || net.state === 'unknown') add('neuron', 'bad', net.state === 'ok'
+    ? "The sensor's internet works, but the 4DSKY program isn't sending heartbeats — it has probably crashed or is missing."
+    : "The 4DSKY program isn't sending heartbeats — it may have crashed or be missing (or the sensor may have lost internet).",
     'Turn on "Install unofficial community fixes" in Sensor Keeper (it checks the program, restarts it, or reinstalls the official package), or reboot the sensor. Do NOT use the :1336/reinstall-package link — it uninstalls first and can fail halfway.');
 
   if (heartbeatAgeMin != null) {
@@ -719,6 +741,7 @@ const NEURON_PROBE = `#!/bin/sh
 v=$(dpkg-query -W -f='\${Version}' neuron-sdk-package 2>/dev/null); s=$(dpkg-query -W -f='\${Status}' neuron-sdk-package 2>/dev/null)
 case "$s" in *" installed") echo "SK_NEURON_PKG=$v";; *) echo "SK_NEURON_PKG=missing";; esac
 echo "SK_NEURON_SVC=$(systemctl is-active neuron-sdk 2>/dev/null || true)"
+for h in mlat.jetvision.de stun.voipgate.com testnet.mirrornode.hedera.com; do getent hosts "$h" >/dev/null 2>&1 && echo "SK_DNS_$h=ok" || echo "SK_DNS_$h=fail"; done
 if [ "$(systemctl is-active neuron-sdk 2>/dev/null)" != active ] && systemctl list-unit-files 2>/dev/null | grep -q '^neuron-sdk.service'; then
   systemctl reset-failed neuron-sdk 2>/dev/null; systemctl restart neuron-sdk 2>/dev/null; sleep 8
   echo "SK_NEURON_RESTARTED=yes"; echo "SK_NEURON_SVC_AFTER=$(systemctl is-active neuron-sdk 2>/dev/null || true)"
@@ -758,8 +781,8 @@ const COMMUNITY_FIXES = [
     },
     // Fixed when MLAT connects again.
     async verify(sensor) {
-      const r = await http(`${devBase(sensor.statusUrl)}/status.json`, {}, 8000);
-      return !!(r.json && r.json.mlat && r.json.mlat.status === 'green');
+      const net = await sensorNet(sensor);
+      return net.state === 'ok' || net.state === 'unknown';
     },
   },
   {
@@ -778,8 +801,8 @@ const COMMUNITY_FIXES = [
     async detect(sensor, ctx) {
       const hb = ctx.st.problems && ctx.st.problems.heartbeat;
       if (!hb || now() - hb.since < 30 * 60000) return false;
-      const st = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`);
-      if (!(st.json && st.json.mlat && st.json.mlat.status === 'green')) return false;   // fix internet/DNS first
+      const net = await sensorNet(sensor);
+      if (net.state !== 'ok' && net.state !== 'unknown') return false;   // fix internet/DNS first (the probe also checks DNS)
       const nr = await tryHttp(`${neuronBase(sensor.statusUrl)}/`, {}, 6000);
       return !(nr.ok && /start with entering your device address|Setup Jetvision for Neuron/i.test(nr.text));   // waiting for setup: the owner must finish it
     },
@@ -789,7 +812,15 @@ const COMMUNITY_FIXES = [
       const out = await installDeb(sensor, probe, 'sk-neuron-probe_all.deb', 'sk-neuron-probe');
       const val = (k) => ((out.match(new RegExp(`SK_${k}=([^\\s<]*)`)) || [])[1] || '');
       const pkg = val('NEURON_PKG');
-      fx.probe = { t: now(), pkg, svc: val('NEURON_SVC'), restarted: val('NEURON_RESTARTED') === 'yes', after: val('NEURON_SVC_AFTER') };
+      fx.probe = { t: now(), pkg, svc: val('NEURON_SVC'), restarted: val('NEURON_RESTARTED') === 'yes', after: val('NEURON_SVC_AFTER'),
+        dnsFail: ['mlat.jetvision.de', 'stun.voipgate.com', 'testnet.mirrornode.hedera.com'].filter((h) => val(`DNS_${h}`) === 'fail') };
+      if (fx.probe.dnsFail.length) {
+        // The sensor can't look names up: install the DNS fix (it also restarts the 4DSKY program).
+        log(`${label}: 4DSKY probe: DNS fails on the sensor for ${fx.probe.dnsFail.join(', ')} — installing the DNS fix`);
+        const dnsFix = COMMUNITY_FIXES.find((x) => x.id === 'jv-ksk2024-fix');
+        await installFixPackage(sensor, dnsFix);
+        return `the sensor couldn't look up ${fx.probe.dnsFail.join(', ')}; installed the DNS fix`;
+      }
       log(`${label}: 4DSKY probe: package ${pkg || '?'}, service ${fx.probe.svc || '?'}${fx.probe.restarted ? `, restarted -> ${fx.probe.after || '?'}` : ''}`);
       if (pkg !== 'missing') return fx.probe.restarted ? 'restarted the 4DSKY program' : 'the 4DSKY program is installed and running';
       const r = await http(DEVICE_MANIFEST, {}, 15000);
@@ -834,8 +865,8 @@ const COMMUNITY_FIXES = [
       return voipgateDnssecHealthy();
     },
     async verify(sensor) {
-      const r = await tryHttp(`${devBase(sensor.statusUrl)}/status.json`, {}, 8000);
-      return !!(r.json && r.json.mlat && r.json.mlat.status === 'green');
+      const net = await sensorNet(sensor);
+      return net.state === 'ok' || net.state === 'unknown';
     },
   },
 ];
@@ -1079,8 +1110,10 @@ Nothing here uses real money: testnet HBAR is free and has no value.
     • on the sensor: Settings → Network → Manual (Static IP) — only if you know your network's
       correct netmask, gateway and DNS.
   If the address changes later, Sensor Keeper loses track of the sensor until you update it here.
-  Leave blank (Enter) if it isn't an Air!Squitter or isn't on this network — balance top-ups and
-  heartbeat alerts still work without it.`);
+  Sensors at OTHER locations (another home, office, a relative's house): leave this blank here.
+  Top-ups and heartbeat alerts still work for them from anywhere; for health checks and fixes,
+  install Sensor Keeper on a computer at that location too.
+  Leave blank (Enter) if it isn't an Air!Squitter — top-ups and heartbeat alerts still work.`);
     for (;;) {
       const prevIp = prev && prev.statusUrl ? prev.statusUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
       const a = (await ask(rl, '  Air!Squitter IP address (e.g. 192.168.1.50, Enter to skip)', prevIp)).replace(/^https?:\/\//, '').replace(/\/+$/, '');
@@ -1128,6 +1161,8 @@ Step 2 — Hedera Portal access token (this is what pays for top-ups, for free)
   3. Paste it below. It is stored only in ${CONFIG}.
   Hedera allows up to 100 test HBAR per day per person through this token, and
   one top-up per sensor per day — plenty, since a sensor uses about 7 HBAR a day.
+  If you run Sensor Keeper on more than one computer (e.g. one per location), they can share
+  this token, but the 100 HBAR/day limit is shared too.
 `);
   for (;;) {
     const t = await askSecret(rl, '  Access token', !!old.portalToken);
@@ -1750,7 +1785,7 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
 <section id="tab-settings" class="hidden">
   <div class="card"><h2>1. Your sensor(s)</h2>
     <p class="help">Enter each sensor's own Hedera <b>device account ID</b> (looks like 0.0.1234567) — the account that pays for its heartbeats, not your wallet or rewards account. It's in the 4DSKY app and your sensor's Neuron setup.</p>
-    <p class="help"><b>Air!Squitter IP address:</b> enter <i>your</i> sensor's address on your network (every network is different — find it in your router's list of connected devices, often named "air-squitter", or try air-squitter.local). Sensor Keeper uses it to check the sensor's health, explain problems, and install updates and fixes. <b>The address must be fixed</b>: set a "DHCP reservation" / "fixed IP" for the air-squitter in your router (or a static IP on the sensor if you know your network's settings). If it changes, Sensor Keeper loses track of the sensor until you update it here. Leave it blank if your sensor isn't an Air!Squitter on this network — top-ups and heartbeat alerts still work.</p>
+    <p class="help"><b>Air!Squitter IP address:</b> enter <i>your</i> sensor's address on <i>this computer's</i> network (every network is different — find it in your router's list of connected devices, often named "air-squitter", or try air-squitter.local). Sensor Keeper uses it to check the sensor's health, explain problems, and install updates and fixes. <b>The address must be fixed</b>: set a "DHCP reservation" / "fixed IP" for the air-squitter in your router (or a static IP on the sensor if you know your network's settings). If it changes, Sensor Keeper loses track of the sensor until you update it here. Leave it blank for sensors at other locations or that aren't Air!Squitters — top-ups and heartbeat alerts still work for them; for health checks and fixes at another location, install Sensor Keeper on a computer there too.</p>
     <div id="sensorList"></div><button class="btn" id="addSensor">+ Add another sensor</button></div>
 
   <div class="card"><h2>2. Hedera Portal access token</h2>

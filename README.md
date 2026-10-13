@@ -83,6 +83,26 @@ questions in the terminal instead.
 
 ![Sensor Keeper app — status and activity](docs/screenshot.png)
 
+## Every setup is different
+
+Sensor Keeper doesn't assume anything about your network or hardware:
+
+- **Your sensor's IP address** is whatever *your* router gave it. Setup asks for it, tests it, and explains how
+  to make it **fixed** (DHCP reservation in your router, or a static IP on the sensor). Hostnames such as
+  `air-squitter.local` also work where your computer supports them (an IP address is most reliable on Windows).
+- **Sensors at several locations:** Hedera checks and top-ups work for every sensor from anywhere. Health
+  checks, diagnosis, updates and fixes need to reach the sensor, so they only work from a computer on the
+  **same network** as that sensor. Leave the IP blank for sensors elsewhere, or run Sensor Keeper on a computer
+  at each location (each one watching its local sensors).
+- **More than one Sensor Keeper with the same Hedera token:** fine, but the faucet's 100 HBAR/day limit is per
+  token, so the computers share it. If one hits the limit, the others wait and retry automatically.
+- **Not an Air!Squitter?** Any 4DSKY/Neuron sensor gets balance top-ups and heartbeat alerts. The deeper checks,
+  updates and fixes are for Jetvision Air!Squitters.
+- **MLAT turned off or not registered:** Sensor Keeper doesn't treat that as a fault. It falls back to the
+  heartbeats (and, for fixes, a small probe that checks DNS on the sensor itself).
+- **Changed the sensor's admin password?** Enter it in Settings; otherwise the factory default is used.
+- **Any always-on computer:** Mac, Windows, Linux or Raspberry Pi.
+
 ## Everyday use
 
 Open **Sensor Keeper** from your Applications folder (Mac), Start menu or desktop icon (Windows),
