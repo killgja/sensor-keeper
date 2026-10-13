@@ -12,6 +12,7 @@ Sensor Keeper runs quietly on any always-on computer (Mac, Windows, Linux, Raspb
 - checks each sensor's balance and heartbeats every 30 minutes (Hedera's public mirror node, read-only),
 - tops the sensor up through **Hedera's official Faucet API** when it runs low,
 - optionally checks a Jetvision Air!Squitter's status page on your network,
+- checks that each sensor is **listed as available to buyers** in Neuron's on-chain seller registry (read-only),
 - alerts you (Discord or phone push) **only** when something needs attention,
 - sends an optional weekly "all good" summary,
 - can **keep itself up to date** and **install Air!Squitter software updates** for you (both optional, off by default).
@@ -250,7 +251,7 @@ enter the new ID.
 - Settings are stored in `~/.sensor-keeper/config.json` (Windows: `%USERPROFILE%\.sensor-keeper`),
   readable only by your user account.
 - **No private keys** are ever requested or stored. The faucet sends HBAR straight to your sensor.
-- The only places it talks to: Hedera's mirror node, Hedera's faucet, your sensor's web page
+- The only places it talks to: Hedera's mirror node (including a read-only lookup in Neuron's seller registry contract), Hedera's faucet, your sensor's web page
   (if you add it), the alert services you choose, and — for automatic updates — GitHub (this
   project's releases and `device-updates.json`) and jetvision's public version-history page.
 - The Air!Squitter admin password is only ever sent to your sensor on your own network. If you

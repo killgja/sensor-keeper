@@ -26,7 +26,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.4.2';
+const VERSION = '1.5.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -120,7 +120,27 @@ async function getBalance(id) {
   const r = await http(`${MIRROR}/accounts/${id}?transactions=false`);
   if (r.status === 404) return { missing: true };
   if (!r.ok || !r.json) throw new Error(`mirror node HTTP ${r.status}`);
-  return { balance: hbar(r.json.balance.balance), deleted: !!r.json.deleted };
+  return { balance: hbar(r.json.balance.balance), deleted: !!r.json.deleted, evm: r.json.evm_address || null };
+}
+
+// Is the sensor listed as available to buyers in Neuron's on-chain seller registry
+// (the "Rendezvous" contract the 4DSKY/Neuron software registers with)? Read-only call
+// through the Hedera mirror node — no keys, no fees.
+const NEURON_REGISTRY = process.env.SENSOR_KEEPER_REGISTRY || '0x87e2fc64dc1eae07300c2fc50d6700549e1632ca';
+async function getListing(id, evm) {
+  const num = parseInt(String(id).split('.').pop(), 10);
+  const addr = (evm || ('0x' + num.toString(16).padStart(40, '0'))).replace(/^0x/, '').toLowerCase();
+  const r = await http(`${MIRROR}/contracts/call`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: '0xc8d3d80b' + addr.padStart(64, '0'), to: NEURON_REGISTRY, estimate: false, block: 'latest' }),   // hederaAddressToPeer(address)
+  }, 20000);
+  const hex = r.json && typeof r.json.result === 'string' ? r.json.result.replace(/^0x/, '') : '';
+  if (!r.ok || hex.length < 64 * 5) throw new Error(`registry lookup HTTP ${r.status}`);
+  const w = (i) => hex.slice(i * 64, (i + 1) * 64);
+  const available = parseInt(w(0), 16) === 1;
+  const off = parseInt(w(1), 16) / 32, len = parseInt(w(off), 16) || 0;
+  const peerId = len ? Buffer.from(hex.slice((off + 1) * 64, (off + 1) * 64 + len * 2), 'hex').toString('utf8') : '';
+  return { available, registered: !!peerId, peerId, stdout: `0.0.${parseInt(w(2), 16)}` };
 }
 
 // Heartbeats are consensus-submit-message transactions paid by the sensor account.
@@ -276,6 +296,21 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
     }
   }
 
+  // 3b. listed as available to buyers in Neuron's registry (checked every 6 h)
+  if (!st.listing || now() - st.listing.t > 6 * 3600 * 1000) {
+    try { const l = await getListing(id, bal.evm); st.listing = { t: now(), available: l.available, registered: l.registered }; }
+    catch (e) { log(`${label}: registry check failed: ${e.message}`); }
+  }
+  if (st.listing) {
+    out.listed = st.listing.available;
+    // Only worth an alert while the sensor is otherwise running (if it's offline, that's the real problem).
+    const running = out.heartbeatAgeMin != null && out.heartbeatAgeMin <= cfg.heartbeatAlertMinutes;
+    await problem(cfg, st, 'not-listed', running && !st.listing.available, `Sensor Keeper: ${label} isn't visible to buyers`,
+      st.listing.registered
+        ? "It's sending heartbeats, but Neuron's seller registry marks it as NOT available, so buyers (and 4DSKY) may not see it. Restarting the sensor usually makes the 4DSKY program announce itself again; if not, check the device on explorer.neuron.world or ask 4DSKY support."
+        : "It's sending heartbeats, but it isn't registered in Neuron's seller registry at all, so buyers (and 4DSKY) can't find it. Check its registration on explorer.neuron.world (Service Provider, with the ADSB service) or ask 4DSKY support.");
+  }
+
   // 4. top-up
   const needs = forceTopup || bal.balance < cfg.lowWater;
   if (needs) {
@@ -344,7 +379,8 @@ function describe(r) {
   const days = r.burnPerDay ? ` (~${fmt(r.balance / r.burnPerDay, 0)} days)` : '';
   const hb = r.heartbeatAgeMin == null ? 'no heartbeats' : `last heartbeat ${fmt(r.heartbeatAgeMin, 1)} min ago`;
   const dev = r.deviceIssues ? (r.deviceIssues.length ? `, device: ${r.deviceIssues.join('; ')}` : ', device ok') : '';
-  return `${r.label}: ${fmt(r.balance)} HBAR${days}, ${hb}${dev}${r.topup ? `, top-up: ${r.topup}` : ''}`;
+  const listed = r.listed == null ? '' : r.listed ? ', listed for buyers' : ', NOT listed for buyers';
+  return `${r.label}: ${fmt(r.balance)} HBAR${days}, ${hb}${listed}${dev}${r.topup ? `, top-up: ${r.topup}` : ''}`;
 }
 
 // ---------------------------------------------------------------- self-update
@@ -1572,7 +1608,7 @@ async function runUi() {
           const { devicePassword, ...pub } = s;
           const du = x.deviceUpdate || {};
           return { ...pub, devicePasswordSet: !!devicePassword, software: du.current || null, softwareLatest: du.latest || null,
-            softwareUpdating: du.pending ? du.pending.to : null, balance: x.lastBalance ?? null, burnPerDay: x.burnPerDay ?? null, lastCheck: x.lastCheck || null,
+            softwareUpdating: du.pending ? du.pending.to : null, listed: x.listing ? x.listing.available : null, balance: x.lastBalance ?? null, burnPerDay: x.burnPerDay ?? null, lastCheck: x.lastCheck || null,
             lastTopup: x.lastTopup || null, problems: Object.keys(x.problems || {}) };
         });
         return send(res, 200, {
@@ -1849,7 +1885,7 @@ function renderService(){var v=S.service,d=$('svcDot'),t=$('svcText');
 function renderStatus(){
   $('lastRun').textContent=S.lastRun?('Last checked '+ago(S.lastRun)+'. Checks run every '+S.config.checkEveryMinutes+' minutes.'):'No checks yet.';
   var h='';S.sensors.forEach(function(s){var days=(s.balance!=null&&s.burnPerDay)?Math.round(s.balance/s.burnPerDay):null;
-    var ok=!s.problems.length;h+='<div class="sensor"><div class="actions" style="justify-content:space-between"><div><b>'+esc(s.name||s.id)+'</b> <span class="note">'+esc(s.id)+'</span></div><div class="actions"><span class="pill"><span class="dot '+(ok?'ok':'bad')+'"></span>'+(ok?'Healthy':esc(s.problems.map(function(p){return PROB[p]||p;}).join(', ')))+'</span><button class="btn small" data-topup="'+esc(s.id)+'">Top up now</button></div></div>'+
+    var ok=!s.problems.length;h+='<div class="sensor"><div class="actions" style="justify-content:space-between"><div><b>'+esc(s.name||s.id)+'</b> <span class="note">'+esc(s.id)+'</span>'+(s.listed===true?' <span class="note">· listed for buyers ✓</span>':s.listed===false?' <span class="note" style="color:var(--bad,#c33)">· NOT listed for buyers</span>':'')+'</div><div class="actions"><span class="pill"><span class="dot '+(ok?'ok':'bad')+'"></span>'+(ok?'Healthy':esc(s.problems.map(function(p){return PROB[p]||p;}).join(', ')))+'</span><button class="btn small" data-topup="'+esc(s.id)+'">Top up now</button></div></div>'+
     '<div class="stats" style="margin-top:10px"><div class="stat"><div class="k">Balance</div><div class="v">'+(s.balance!=null?s.balance.toFixed(1):'–')+' <span style="font-size:13px">HBAR</span></div></div><div class="stat"><div class="k">Days left</div><div class="v">'+(days!=null?days:'–')+'</div></div><div class="stat"><div class="k">Uses per day</div><div class="v">'+(s.burnPerDay?s.burnPerDay.toFixed(1):'–')+'</div></div><div class="stat"><div class="k">Last top-up</div><div class="v" style="font-size:15px">'+(s.lastTopup?ago(s.lastTopup):'never')+'</div></div></div></div>';});
   $('sensorStatus').innerHTML=h||'<p class="help">No sensors yet — open <a href="#" id="goSet">Settings</a> to add yours.</p>';
   if($('goSet'))$('goSet').onclick=function(e){e.preventDefault();showTab('settings');};
