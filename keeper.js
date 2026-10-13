@@ -3,7 +3,8 @@
  * Sensor Keeper — keeps 4DSKY / Neuron sensors funded with Hedera testnet HBAR.
  *
  * Unofficial community tool. Not affiliated with 4DSKY, Neuron or Hedera.
- * Requires Node.js 18+ (or use a standalone build). No third-party packages.
+ * Requires Node.js 18+ (22+ for the Sky Warden live-traffic relay). Release builds bundle
+ * the Hedera SDK for the optional Sky Warden remote control (see docs/remote-protocol.md).
  *
  * How it works
  *   - Reads each sensor's balance and recent heartbeats from Hedera's public
@@ -26,7 +27,7 @@ const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 
-const VERSION = '1.5.0';
+const VERSION = '1.6.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -1002,6 +1003,57 @@ async function communityFixesAll(cfg, opts = {}) {
   return out;
 }
 
+// ---------------------------------------------------------------- Sky Warden remote control (opt-in)
+// Lets the Sky Warden iPhone app ask for a few fixed actions over Hedera (testnet). See
+// docs/remote-protocol.md. Off until you run "remote-setup" and "remote-pair".
+let _remote = null;
+function saveRemote(r) { const raw = readJson(CONFIG, {}); raw.remote = r; writePrivate(CONFIG, raw); }
+function remote() {
+  if (!_remote) _remote = require('./remote')({ loadConfig, saveRemote, loadState, saveState, log, http, MIRROR, handlers: REMOTE_HANDLERS });
+  return _remote;
+}
+const REMOTE_HANDLERS = {
+  async check(cfg, sensor) {
+    const [bal, hb] = await Promise.all([getBalance(sensor.id).catch(() => null), getHeartbeats(sensor.id).catch(() => ({}))]);
+    const age = hb.lastAgeMin;
+    const parts = [age == null ? 'No heartbeats found' : `Last heartbeat ${age < 2 ? 'just now' : `${Math.round(age)} min ago`}`];
+    if (bal && bal.balance != null) parts.push(`${fmt(bal.balance, 0)} HBAR`);
+    if (!sensor.statusUrl) return { ok: age != null && age <= cfg.heartbeatAlertMinutes, summary: parts.join(' · '), detail: "No AirSquitter address in Sensor Keeper, so only Hedera data was checked." };
+    const f = await diagnoseSensor(cfg, sensor, { heartbeatAgeMin: age }).catch((e) => [{ level: 'warn', text: `Couldn't reach the sensor: ${e.message}` }]);
+    const bad = f.filter((x) => x.level === 'bad');
+    return { ok: !bad.length, summary: `${parts.join(' · ')} · ${bad.length ? `${bad.length} problem${bad.length > 1 ? 's' : ''}` : 'all checks passed'}`,
+      detail: f.map((x) => `${x.level === 'ok' ? '✓' : x.level === 'warn' ? '!' : '✗'} ${x.text}`).join('\n') };
+  },
+  async restart4dsky(cfg, sensor) {
+    if (!sensor.statusUrl) throw new Error("this sensor has no AirSquitter address in Sensor Keeper's settings");
+    const fix = COMMUNITY_FIXES.find((f) => f.id === 'neuron-sdk-repair');
+    const did = await fix.run(cfg, sensor, sensor.name || sensor.id, {});
+    return { ok: true, summary: `${did.charAt(0).toUpperCase()}${did.slice(1)}.` };
+  },
+  // Snapshot of the aircraft the sensor hears right now (from its own aircraftlist.json).
+  async traffic(cfg, sensor) {
+    if (!sensor.statusUrl) throw new Error("this sensor has no AirSquitter address in Sensor Keeper's settings");
+    const r = await tryHttp(`${devBase(sensor.statusUrl)}/aircraftlist.json`, {}, 10000);
+    if (!r.ok || !Array.isArray(r.json)) throw new Error("couldn't read the sensor's aircraft list");
+    const list = r.json;
+    const pos = list.filter((a) => a.lat != null && a.lon != null);
+    const far = pos.reduce((m, a) => Math.max(m, Number(a.dis) || 0), 0);
+    const near = pos.filter((a) => a.dis != null).sort((a, b) => a.dis - b.dis).slice(0, 8)
+      .map((a) => [(a.fli || a.reg || a.hex || '').trim(), (a.typ || '').trim(), a.alt != null ? `${a.alt} ft` : '', `${Math.round(a.dis)} km`].filter(Boolean).join(' '));
+    return { ok: true, summary: `${list.length} aircraft heard, ${pos.length} with position, farthest ${Math.round(far)} km`,
+      detail: near.length ? `Nearest:\n${near.join('\n')}` : 'No aircraft with a position right now.' };
+  },
+  async applyFix(cfg, sensor, args) {
+    if (cfg.communityFixes !== true) throw new Error('community fixes are turned off in Sensor Keeper');
+    const fix = COMMUNITY_FIXES.find((f) => f.id === args.fix);
+    if (!fix || !sensor.statusUrl) throw new Error('unknown fix, or no AirSquitter address for this sensor');
+    const st = loadState();
+    const r = await applyFix(cfg, st, sensor, fix, { force: true });
+    saveState(st);
+    return { ok: !/fail/i.test(r), summary: r };
+  },
+};
+
 // ---------------------------------------------------------------- run loop
 function acquireLock() {
   ensureHome();
@@ -1021,6 +1073,9 @@ async function runLoop() {
   if (!cfg || !cfg.sensors.length) { console.error(`Not set up yet. Run: ${APP} setup`); process.exit(1); }
   if (!acquireLock()) { log('another Sensor Keeper is already running — exiting'); process.exit(0); }
   log(`Sensor Keeper ${VERSION} started, watching ${cfg.sensors.map((s) => s.id).join(', ')}${cfg.dryRun ? ' [dry-run]' : ''}`);
+  if (cfg.remote && cfg.remote.topic) log(`Sky Warden remote control is on (topic ${cfg.remote.topic})`);
+  setInterval(() => { const c = loadConfig(); if (c && c.remote && c.remote.topic) remote().poll().catch(() => {}); }, 5000);
+  if (cfg.remote && cfg.remote.relay) remote().relayConnect();
   let lastCheck = 0;
   let lastUpdateTry = 0;
   const selfFile = selfTarget().file;
@@ -1545,6 +1600,7 @@ function publicConfig(cfg) {
   c.sensors = (c.sensors || []).map(({ devicePassword, ...s }) => ({ ...s, devicePasswordSet: !!devicePassword }));
   c.tokenSet = !!t;
   c.tokenHint = t ? '…' + t.slice(-4) : '';
+  if (c.remote) c.remote = { control: c.remote.control ? c.remote.control.account : null, topic: c.remote.topic || null, phoneAccount: c.remote.phoneAccount || null, pairedAt: c.remote.pairedAt || null };
   return c;
 }
 
@@ -1955,6 +2011,11 @@ Usage: ${APP} <command>
   diagnose            Explain in plain language what's wrong with a sensor and what to do
   fixes               List unofficial community fixes and whether your sensors need them
   apply-fix <id>      Install a community fix now (only if the sensor shows the problem)
+  remote-setup        Sky Warden remote control: add your free control account (testnet)
+  remote-pair         Pair the Sky Warden iPhone app (shows a QR code on this screen)
+  remote-relay <url>  Use a Sky Warden relay for live traffic away from home (or "off")
+  remote-status       Show the remote-control pairing
+  remote-unpair       Remove the pairing (deletes the command topic)
   logs                Show the last 40 log lines
   version             Print the version
 
@@ -2044,6 +2105,63 @@ async function main() {
       console.log(u.updated ? `Updated to v${u.version}. The background service restarts into it within a minute.` : `No update installed: ${u.reason}`);
       return;
     }
+    case 'remote-setup': {
+      needCfg();
+      const rl = makeRl();
+      try {
+        console.log('Sky Warden remote control uses a separate, free Hedera testnet account (the "control" account)');
+        console.log('from portal.hedera.com. Its private key is saved only on this computer. Never use your sensor\'s account.\n');
+        const acct = await ask(rl, 'Control account ID (0.0.xxxxxxx)');
+        if (!isAccountId(acct)) throw new Error('that is not a Hedera account ID');
+        const key = await askSecret(rl, 'Control account private key (hidden)');
+        const { balance } = await remote().setControl(acct, key);
+        console.log(`\nSaved. ${acct} has ${fmt(balance, 0)} test HBAR. Next: ${APP} remote-pair`);
+      } finally { rl.close(); }
+      return;
+    }
+    case 'remote-pair': {
+      needCfg();
+      console.log('Creating a phone account and a private command topic on Hedera testnet…');
+      const res = await remote().pair(os.hostname().replace(/\.local$/, ''));
+      const png = path.join(HOME, 'skywarden-pair.png');
+      await require('qrcode').toFile(png, JSON.stringify(res.payload), { errorCorrectionLevel: 'M', width: 640, margin: 2 });
+      try { fs.chmodSync(png, 0o600); } catch {}
+      if (process.argv.includes('--simulator')) {
+        // Testing: put the code on the booted iOS Simulator's clipboard instead of showing a QR code.
+        execFileSync('xcrun', ['simctl', 'pbcopy', 'booted'], { input: JSON.stringify(res.payload) });
+        try { fs.unlinkSync(png); } catch {}
+        console.log(`Paired topic ${res.topic}, phone account ${res.phoneAccount}. The code is on the Simulator's clipboard: paste it in Sky Warden → Remote control.`);
+        return;
+      }
+      if (process.platform === 'darwin') spawn('open', [png], { detached: true, stdio: 'ignore' }).unref();
+      else console.log(`Open ${png} to see the pairing code.`);
+      console.log(`\nPaired topic ${res.topic}, phone account ${res.phoneAccount}.`);
+      console.log('In Sky Warden: tap the link icon (top-left) → Scan pairing code, and point the phone at the QR code on this screen.');
+      const rl = makeRl();
+      try { await ask(rl, '\nPress Enter only AFTER Sky Warden says "Paired" (the QR image is then deleted)'); } catch {}
+      rl.close();
+      try { fs.unlinkSync(png); } catch {}
+      console.log('Done. Restart the background service (or wait for it to restart) so it starts listening.');
+      return;
+    }
+    case 'remote-listen': {
+      // Listen for Sky Warden requests in the foreground (also part of "run").
+      const c = needCfg();
+      if (!c.remote || !c.remote.topic) { console.error(`Not paired. Run: ${APP} remote-setup, then ${APP} remote-pair`); process.exit(1); }
+      console.log(`Listening for Sky Warden requests on ${c.remote.topic} (Ctrl+C to stop)…`);
+      if (c.remote.relay) remote().relayConnect();
+      for (;;) { await remote().poll(); await sleep(5000); }
+    }
+    case 'remote-relay': {
+      needCfg();
+      const u = argv[1];
+      if (u && !/^https:\/\/[a-z0-9.-]+(\/)?$/i.test(u)) { console.error(`Usage: ${APP} remote-relay https://skywarden-relay.<you>.workers.dev   (or "off")`); process.exit(1); }
+      remote().setRelay(u && u !== 'off' ? u : '');
+      console.log(u && u !== 'off' ? `Relay set to ${u}. Pair the phone again so it learns the relay address.` : 'Relay turned off.');
+      return;
+    }
+    case 'remote-status': { console.log(JSON.stringify(remote().status(), null, 2)); return; }
+    case 'remote-unpair': { console.log((await remote().unpair()) ? 'Unpaired: the command topic was deleted.' : 'No phone was paired.'); return; }
     default: help();
   }
 }
