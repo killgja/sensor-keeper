@@ -28,7 +28,7 @@ const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const netSock = require('net');
 
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -202,6 +202,41 @@ async function requestFaucet(cfg, state, id, amount) {
   throw err;
 }
 
+// Hedera's portal sometimes puts a "Just a moment..." bot check in front of the faucet API. That is
+// Hedera blocking automated requests, not a problem with your token.
+function isBotCheck(e) {
+  return !!e && (e.status === 403 || e.status === 503) && /just a moment|challenge|cloudflare|<!doctype/i.test(String(e.message || ''));
+}
+
+// Reserve account (optional): a testnet account of yours that Sensor Keeper sends HBAR from when the
+// faucet is blocked. The transfer goes straight to the Hedera network, so the portal's bot check
+// doesn't matter. cfg.reserve = { account: '0.0.N', key: '<private key>', floor: 50, refillTo: 0 }
+let _reserveKeyType = null;
+async function reserveKey(cfg) {
+  const { PrivateKey } = require('@hashgraph/sdk');
+  const k = String(cfg.reserve.key || '').trim();
+  if (/^(0x)?30[0-9a-f]{90,}$/i.test(k)) { try { return PrivateKey.fromStringDer(k.replace(/^0x/i, '')); } catch { /* not DER after all */ } }
+  if (!_reserveKeyType) {
+    const r = await http(`${MIRROR}/accounts/${cfg.reserve.account}?transactions=false`);
+    _reserveKeyType = (r.json && r.json.key && r.json.key._type) || 'ED25519';
+  }
+  const hex = k.replace(/^0x/i, '');
+  return /ECDSA/.test(_reserveKeyType) ? PrivateKey.fromStringECDSA(hex) : PrivateKey.fromStringED25519(hex);
+}
+async function reserveSend(cfg, to, amount) {
+  const { Client, TransferTransaction, Hbar } = require('@hashgraph/sdk');
+  const key = await reserveKey(cfg);
+  const client = Client.forTestnet().setOperator(cfg.reserve.account, key);
+  try {
+    const tx = await new TransferTransaction()
+      .addHbarTransfer(cfg.reserve.account, new Hbar(-amount)).addHbarTransfer(to, new Hbar(amount))
+      .setTransactionMemo('Sensor Keeper reserve top-up').execute(client);
+    const rc = await tx.getReceipt(client);
+    if (String(rc.status) !== 'SUCCESS') throw new Error(`transfer status ${rc.status}`);
+    return tx.transactionId.toString();
+  } finally { client.close(); }
+}
+
 // ---------------------------------------------------------------- alerts
 async function sendAlert(cfg, title, body, priority = 'default') {
   const sent = [];
@@ -352,12 +387,41 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
         } else out.topup = `[dry-run] would request ${amount} HBAR`;
         await problem(cfg, st, 'topup', false, `Sensor Keeper: top-up failing for ${label}`, '');
         state.tokenBadUntil = 0;
+        state.faucetBlockedAt = 0;
         await problem(cfg, state, 'token', false, 'Sensor Keeper: Hedera Portal token rejected', '');
+        await problem(cfg, st, 'faucetBlocked', false, `Sensor Keeper: automatic top-ups paused for ${label}`, '');
       } catch (e) {
         st.topupFails = (st.topupFails || 0) + 1;
         out.topup = `FAILED: ${e.message}`;
         log(`${label}: top-up failed: ${e.message}`);
-        if (e.status === 401 || e.status === 403) {
+        if (isBotCheck(e)) {
+          // Not your token: Hedera is blocking automated requests. Use the reserve, or retry quietly.
+          state.faucetBlockedAt = now();
+          state.tokenBadUntil = 0;
+          await problem(cfg, state, 'token', false, 'Sensor Keeper: Hedera Portal token rejected', '');
+          st.lastTopup = now() - DAY + 3 * 3600 * 1000;   // try the faucet again in ~3 h
+          out.topup = "Hedera is blocking automatic top-ups right now (your token is fine); will retry";
+          log(`${label}: Hedera's portal answered with a bot check, not a token error; retrying in ~3 h`);
+          let covered = false;
+          if (cfg.reserve && cfg.reserve.account && cfg.reserve.key && !cfg.dryRun) {
+            try {
+              const rb = await getBalance(cfg.reserve.account);
+              const floor = cfg.reserve.floor ?? 50;
+              if (!rb.missing && rb.balance - amount >= floor) {
+                const txId = await reserveSend(cfg, id, amount);
+                st.lastTopup = now();
+                covered = true;
+                out.topup = `sent ${amount} HBAR from your reserve account ${cfg.reserve.account} (faucet blocked; tx ${txId})`;
+                log(`${label}: faucet blocked, so sent ${amount} HBAR from reserve ${cfg.reserve.account}, tx ${txId}`);
+              } else log(`${label}: reserve ${cfg.reserve.account} is too low (${rb.missing ? 'missing' : fmt(rb.balance)} HBAR) to cover a top-up`);
+            } catch (e2) { log(`${label}: reserve transfer failed: ${e2.message}`); }
+          }
+          // Only bother you when it starts to matter: under two weeks of HBAR left and nothing covered it.
+          const daysLeft = st.burnPerDay ? bal.balance / st.burnPerDay : null;
+          await problem(cfg, st, 'faucetBlocked', !covered && daysLeft !== null && daysLeft < 14,
+            `Sensor Keeper: automatic top-ups paused for ${label}`,
+            `Hedera's portal is blocking automated top-up requests right now (it shows a "Just a moment..." check). Your token is fine and Sensor Keeper keeps retrying.\nBalance is ${fmt(bal.balance)} HBAR (~${fmt(daysLeft, 1)} days left). Add a reserve account (${APP} set-reserve) or add HBAR at portal.hedera.com/faucet if this lasts.`);
+        } else if (e.status === 401 || e.status === 403) {
           state.tokenBadUntil = now() + 6 * 3600 * 1000;   // don't hammer the faucet with a bad token
           await problem(cfg, state, 'token', true, 'Sensor Keeper: Hedera Portal token rejected',
             `The faucet refused your access token (${e.status}: ${e.message.replace(/^faucet HTTP \d+: /, '')}). Create a Personal Access Token in your portal.hedera.com account settings and run "${APP} setup".`);
@@ -384,9 +448,32 @@ async function checkAll(cfg, opts = {}) {
     try { results.push(await checkSensor(cfg, state, s, opts)); }
     catch (e) { log(`${s.id}: unexpected error: ${e.stack || e.message}`); results.push({ id: s.id, label: s.id, error: e.message }); }
   }
+  try { await maybeRefillReserve(cfg, state); } catch (e) { log(`reserve refill: ${e.message}`); }
   state.lastRun = now();
   saveState(state);
   return { results, state };
+}
+
+// Keep the reserve topped up with faucet allowance your sensors didn't need today (refillTo > 0).
+async function maybeRefillReserve(cfg, state) {
+  const r = cfg.reserve;
+  if (!r || !r.account || !(r.refillTo > 0) || cfg.dryRun || !cfg.portalToken) return;
+  if (state.faucetBlockedAt && now() - state.faucetBlockedAt < 6 * 3600 * 1000) return;
+  if (now() - (state.reserveRefillAt || 0) < DAY) return;
+  const left = Math.floor(FAUCET_DAILY_LIMIT - faucetUsed24h(state));
+  if (left < 1) return;
+  const rb = await getBalance(r.account);
+  if (rb.missing || rb.balance >= r.refillTo) return;
+  const amount = Math.min(left, FAUCET_MAX_REQUEST, Math.ceil(r.refillTo - rb.balance));
+  try {
+    const res = await requestFaucet(cfg, state, r.account, amount);
+    state.reserveRefillAt = now();
+    log(`reserve ${r.account}: refilled with ${amount} HBAR of unused faucet allowance${res.tx ? `, tx ${res.tx}` : ''}`);
+  } catch (e) {
+    if (isBotCheck(e)) state.faucetBlockedAt = now();
+    state.reserveRefillAt = now() - DAY + 3 * 3600 * 1000;
+    log(`reserve ${r.account}: refill failed: ${e.message.slice(0, 120)}`);
+  }
 }
 
 function describe(r) {
@@ -1696,6 +1783,7 @@ function publicConfig(cfg) {
   c.tokenSet = !!t;
   c.tokenHint = t ? '…' + t.slice(-4) : '';
   if (c.network) c.network = { url: c.network.url, feederId: c.network.feederId, share: !!c.network.share };
+  if (c.reserve) c.reserve = { account: c.reserve.account || null, floor: c.reserve.floor ?? 50, refillTo: c.reserve.refillTo || 0, keySet: !!c.reserve.key };
   if (c.remote) c.remote = { control: c.remote.control ? c.remote.control.account : null, topic: c.remote.topic || null, phoneAccount: c.remote.phoneAccount || null, pairedAt: c.remote.pairedAt || null };
   return c;
 }
@@ -2113,6 +2201,8 @@ Usage: ${APP} <command>
   remote-status       Show the remote-control pairing
   set-plug <id> shelly|kasa <ip>   Smart plug on a sensor's power, so Sensor Keeper can restart it ("off" to remove)
   power-cycle <id>    Turn a sensor off and on again through its smart plug
+  set-reserve 0.0.x [refill-to]   Reserve account to top up from when Hedera's faucet is blocked
+                      (key from SENSOR_KEEPER_RESERVE_KEY or typed in; "off" removes it)
   remote-unpair       Remove the pairing (deletes the command topic)
   network-join CODE   Share live aircraft with the Sky Warden network map (invite only)
   network-share on|off  Turn network sharing on or off
@@ -2301,6 +2391,24 @@ async function main() {
       }
       writePrivate(CONFIG, raw);
       console.log(s2.plug ? `Plug set. It reports: ${await plugStatus(s2)}` : 'Plug removed.');
+      return;
+    }
+    case 'set-reserve': {
+      const raw = readJson(CONFIG, null);
+      if (!raw) { console.error(`Run ${APP} setup first.`); process.exit(1); }
+      if (argv[1] === 'off') { delete raw.reserve; writePrivate(CONFIG, raw); console.log('Reserve removed.'); return; }
+      if (!/^0\.0\.\d+$/.test(argv[1] || '')) { console.error(`Usage: ${APP} set-reserve <0.0.N account> [refill-to HBAR]   (or: set-reserve off)`); process.exit(1); }
+      let key = (process.env.SENSOR_KEEPER_RESERVE_KEY || '').trim();
+      if (!key) {
+        const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+        key = (await new Promise((res) => rl.question('Private key of that account (not shown anywhere afterwards): ', res))).trim();
+        rl.close();
+      }
+      if (!key) { console.error('No key given.'); process.exit(1); }
+      raw.reserve = { account: argv[1], key, floor: 50, refillTo: Math.max(0, parseInt(argv[2] || '0', 10) || 0) };
+      writePrivate(CONFIG, raw);
+      const b = await getBalance(argv[1]).catch(() => null);
+      console.log(`Reserve set: ${argv[1]}${b && !b.missing ? ` (${fmt(b.balance)} HBAR)` : ''}. Used only when Hedera's faucet blocks automatic top-ups.`);
       return;
     }
     case 'power-cycle': {

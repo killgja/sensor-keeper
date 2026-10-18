@@ -134,6 +134,7 @@ sensor-keeper diagnose      explain what's wrong with a sensor and what to do
 sensor-keeper fixes         list unofficial community fixes and whether you need them
 sensor-keeper set-plug 0.0.x shelly|kasa <ip>   smart plug on the sensor's power ("off" removes it)
 sensor-keeper power-cycle 0.0.x   switch the sensor off and on through its smart plug
+sensor-keeper set-reserve 0.0.x   backup account to top up from if Hedera's faucet is blocked
 sensor-keeper uninstall-service
 ```
 
@@ -154,6 +155,25 @@ section:
 Messages go through the Sky Warden relay, end-to-end encrypted with the pairing secret (the relay
 can't read them), or over the private Hedera topic when no relay is set. Only a fixed list of
 commands is ever run; see [docs/remote-protocol.md](docs/remote-protocol.md).
+
+## When Hedera's faucet is blocked
+
+Hedera's portal sometimes puts a "Just a moment..." bot check in front of its faucet, which blocks
+every automated top-up for a while. Sensor Keeper recognises this (it is **not** a problem with your
+token), keeps retrying every few hours, and only alerts you if your sensor gets under two weeks of HBAR.
+
+To keep topping up during those times, give Sensor Keeper a **reserve account**: any testnet account
+of yours with spare HBAR. When the faucet is blocked, Sensor Keeper sends the top-up from it directly
+over the Hedera network, which the portal's bot check doesn't affect.
+
+```text
+sensor-keeper set-reserve 0.0.x          asks for that account's private key
+sensor-keeper set-reserve 0.0.x 500      also refill it to 500 HBAR with faucet allowance your sensors didn't need
+sensor-keeper set-reserve off
+```
+
+The key stays in Sensor Keeper's config file on your computer (readable only by you) and is never
+shown in the app. A reserve is never drained below 50 HBAR.
 
 ## Smart plug (optional): restart a frozen sensor
 
