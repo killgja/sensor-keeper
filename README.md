@@ -162,8 +162,12 @@ Hedera's portal sometimes puts a "Just a moment..." bot check in front of its fa
 every automated top-up for a while. Sensor Keeper recognises this (it is **not** a problem with your
 token), keeps retrying every few hours, and only alerts you if your sensor gets under two weeks of HBAR.
 
-To keep topping up during those times, give Sensor Keeper a **reserve account**: any testnet account
-of yours with spare HBAR. When the faucet is blocked, Sensor Keeper sends the top-up from it directly
+While the faucet is blocked, Sensor Keeper also asks the **shared Sky Warden reserve** for help when a
+sensor drops under 50 HBAR. It sends 60 HBAR to real 4DSKY sensors (heartbeats in the last day), once a
+day each, with no sign-up. Turn it off with `"sharedReserve": false` in the config.
+
+You can also give Sensor Keeper a **reserve account** of your own: any testnet account
+with spare HBAR. When the faucet is blocked, Sensor Keeper sends the top-up from it directly
 over the Hedera network, which the portal's bot check doesn't affect.
 
 ```text

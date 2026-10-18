@@ -1,6 +1,6 @@
 {
   "name": "sensor-keeper",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "private": true,
   "description": "Keeps 4DSKY / Neuron sensors funded and healthy. Optional Sky Warden remote control over Hedera.",
   "main": "keeper.js",
