@@ -132,10 +132,46 @@ sensor-keeper update        install the latest Sensor Keeper now
 sensor-keeper update-sensors  check for and install Air!Squitter software now
 sensor-keeper diagnose      explain what's wrong with a sensor and what to do
 sensor-keeper fixes         list unofficial community fixes and whether you need them
+sensor-keeper set-plug 0.0.x shelly|kasa <ip>   smart plug on the sensor's power ("off" removes it)
+sensor-keeper power-cycle 0.0.x   switch the sensor off and on through its smart plug
 sensor-keeper uninstall-service
 ```
 
 Add `--dry-run` to `check`, `topup` or `run` to see what it would do without requesting HBAR.
+
+## Fix it from your phone (Sky Warden app)
+
+Pair Sensor Keeper with the Sky Warden iPhone app (`sensor-keeper remote-setup`, then `sensor-keeper remote-pair`, and scan the QR
+code on your computer's screen). Each device page in the app then has a **Sensor Keeper at home**
+section:
+
+- **Diagnose** — Sensor Keeper checks the sensor from inside your home network and answers in
+  seconds: does it answer, can it reach the internet, is the 4DSKY program sending heartbeats.
+  The app runs this by itself when a device goes offline.
+- **Restart the 4DSKY program**.
+- **Power-cycle** — switches a frozen sensor off and on through a smart plug (below).
+
+Messages go through the Sky Warden relay, end-to-end encrypted with the pairing secret (the relay
+can't read them), or over the private Hedera topic when no relay is set. Only a fixed list of
+commands is ever run; see [docs/remote-protocol.md](docs/remote-protocol.md).
+
+## Smart plug (optional): restart a frozen sensor
+
+A sensor that froze or lost Wi-Fi for good only comes back when its power is switched off and on.
+Put its power adapter on a smart plug and tell Sensor Keeper where it is:
+
+```text
+sensor-keeper set-plug 0.0.x shelly 192.168.1.60
+sensor-keeper power-cycle 0.0.x        try it
+```
+
+- Supported: **Shelly** Gen2+ plugs (local RPC; the plug turns itself back on after 10 s) and
+  **TP-Link Kasa** plugs with the older local protocol. Tapo plugs and newer Kasa firmware
+  (KLAP login) aren't supported yet. Everything stays on your network; no cloud account.
+- Give the plug a fixed IP address in your router.
+- **Automatic:** when the sensor's status page fails two checks in a row, Sensor Keeper
+  power-cycles it by itself (at most every 3 hours) and alerts you. Turn this off with
+  `"autoPowerCycle": false` in the config.
 
 ## Automatic updates
 

@@ -11,7 +11,7 @@
 const crypto = require('crypto');
 
 const PROTO = 'skywarden-remote-v1';
-const ALLOWED = ['check', 'restart4dsky', 'applyFix', 'traffic'];
+const ALLOWED = ['check', 'restart4dsky', 'applyFix', 'traffic', 'powerCycle'];
 const MAX_SKEW_S = 300;
 const MAX_PER_HOUR = 10;
 const MAX_PLAINTEXT = 640;   // keeps every message in a single 1 KB HCS chunk
@@ -69,7 +69,7 @@ function decrypt(secretB64, topic, b64) {
 // Sensors this computer watches, as the phone needs them (no passwords).
 function sensorList(cfg) {
   return (cfg.sensors || []).map((x) => ({ id: x.id, name: x.name || x.id,
-    local: x.statusUrl ? x.statusUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '') : null }));
+    local: x.statusUrl ? x.statusUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '') : null, plug: !!(x.plug && x.plug.host) }));
 }
 
 module.exports = function createRemote(k) {
@@ -228,19 +228,57 @@ module.exports = function createRemote(k) {
     }
   }
 
+  const relaySeen = [];
+  let relayHits = [];
+  async function runRelayCmd(cur, m) {
+    const reply = (o) => sendRelay(cur.rc, { t: 'res', id: m.id, client: m.client, ts: Math.floor(Date.now() / 1000), ...o });
+    if (relaySeen.includes(m.id) || Math.abs((m.ts || 0) - Date.now() / 1000) > MAX_SKEW_S) return;
+    relaySeen.push(m.id); if (relaySeen.length > 200) relaySeen.shift();
+    relayHits = relayHits.filter((t) => Date.now() - t < 3600e3);
+    if (relayHits.length >= MAX_PER_HOUR * 2) { reply({ ok: false, summary: 'Too many requests this hour — try again later.' }); return; }
+    relayHits.push(Date.now());
+    const sensor = (cur.cfg.sensors || []).find((s) => s.id === m.sensor);
+    if (!ALLOWED.includes(m.cmd) || !sensor) { reply({ ok: false, summary: 'Not allowed: unknown command or sensor.' }); return; }
+    k.log(`remote: ${m.cmd} for ${sensor.name || sensor.id} requested from Sky Warden (relay)`);
+    reply({ ok: true, working: true, summary: 'Sensor Keeper is on it…' });
+    let out;
+    try { out = await k.handlers[m.cmd](cur.cfg, sensor, m.args || {}); }
+    catch (e) { out = { ok: false, summary: `Failed: ${e.message}` }; }
+    reply(out);
+    k.log(`remote: ${m.cmd} for ${sensor.name || sensor.id}: ${out.summary}`);
+  }
+
   function setStreaming() {
     if (subs.size && !streamTimer) { streamOnce(); streamTimer = setInterval(streamOnce, 5000); }
     if (!subs.size && streamTimer) { clearInterval(streamTimer); streamTimer = null; }
+  }
+
+  // One live socket at a time. Every handler checks it still owns `ws`, so a socket that was
+  // replaced or closed late can't null out (or re-dial over) the current one. Before 1.6.1 a
+  // late close plus the watchdog could start two dial loops that kept bumping each other off.
+  let reconnectTimer = null, openedAt = 0;
+
+  function scheduleReconnect(delay) {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; relayConnect(); }, delay);
   }
 
   function relayConnect() {
     const info = relayInfo();
     if (!info) return;
     if (typeof WebSocket !== 'function') { k.log('remote: this Node.js has no WebSocket support (needs Node 22+) — live traffic is off'); return; }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;   // already connecting / connected
     wsKey = info.url;
-    ws = new WebSocket(info.url);
-    ws.onopen = () => { backoff = 2000; k.log('remote: connected to the Sky Warden relay'); };
-    ws.onmessage = (ev) => {
+    const sock = new WebSocket(info.url);
+    ws = sock;
+    sock.onopen = () => {
+      if (ws !== sock) return;
+      openedAt = Date.now();
+      k.log('remote: connected to the Sky Warden relay');
+    };
+    sock.onmessage = (ev) => {
+      if (ws !== sock) return;
       const text = String(ev.data);
       if (text === 'pong') return;
       if (text.startsWith('{')) {   // relay control message (plaintext, no secrets)
@@ -251,21 +289,28 @@ module.exports = function createRemote(k) {
       if (!cur) return;
       let m;
       try { m = openRaw(cur.rc.secret, `${RELAY_PROTO}|${roomId(cur.rc.secret)}`, text); } catch { return; }
-      if (m.t === 'listSensors' && typeof m.client === 'string') { sendRelay(cur.rc, { t: 'sensors', client: m.client, sensors: sensorList(cur.cfg) }); return; }
+      if (m.t === 'listSensors' && typeof m.client === 'string') { sendRelay(cur.rc, { t: 'sensors', client: m.client, sensors: sensorList(cur.cfg), network: (k.networkAccess && k.networkAccess()) || null }); return; }
+      // Commands over the relay (same commands and limits as the Hedera topic, answered in seconds).
+      if (m.t === 'cmd' && typeof m.id === 'string' && typeof m.client === 'string') { runRelayCmd(cur, m); return; }
       if (m.t === 'sub' && typeof m.sensor === 'string' && typeof m.client === 'string') subs.set(m.client, m.sensor);
       if (m.t === 'unsub' && typeof m.client === 'string') subs.delete(m.client);
       setStreaming();
     };
-    ws.onclose = () => {
+    sock.onclose = (ev) => {
+      if (ws !== sock) return;   // an old socket closing late — ignore
       ws = null; subs.clear(); setStreaming();
-      setTimeout(relayConnect, backoff);
+      const lived = openedAt ? Date.now() - openedAt : 0;
+      openedAt = 0;
+      if (lived > 60000) backoff = 2000;   // only a connection that stayed up resets the backoff
+      if (ev && ev.code === 4000) { k.log('remote: relay says another Sensor Keeper took over this pairing — is it running on two computers?'); backoff = Math.max(backoff, 60000); }
+      scheduleReconnect(backoff);
       backoff = Math.min(backoff * 2, 5 * 60 * 1000);
     };
-    ws.onerror = () => {};
+    sock.onerror = () => {};
     if (!pingTimer) pingTimer = setInterval(() => {
       const cur = relayInfo();
       if (ws && cur && cur.url !== wsKey) { try { ws.close(); } catch {} return; }   // re-paired: reconnect to the new room
-      if (!ws && cur) { relayConnect(); return; }
+      if (!ws && cur && !reconnectTimer) { relayConnect(); return; }
       if (ws && ws.readyState === 1) ws.send('ping');
     }, 30000);
   }

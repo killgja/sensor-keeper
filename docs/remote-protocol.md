@@ -1,4 +1,4 @@
-# Sky Warden ⇄ Sensor Keeper remote protocol (v1, Hedera testnet)
+# Sky Warden ⇄ Sensor Keeper remote protocol (v1)
 
 Lets the Sky Warden iPhone app ask Sensor Keeper (running on a computer on the sensor's home
 network) to run a small, fixed set of actions — from anywhere, with no server and no open ports.
@@ -46,6 +46,8 @@ Progress messages use `"t":"prog"` with the same id.
 | `check` | Runs its normal diagnosis for that sensor and replies with the result. |
 | `restart4dsky` | Uses its existing neuron-sdk-repair probe to restart the 4DSKY program on the sensor. |
 | `applyFix` | Applies one community fix by name (`args.fix`), only if listed in its `COMMUNITY_FIXES` and only if the user has community fixes enabled. |
+| `traffic` | Replies with what the sensor is hearing right now (aircraft counts). |
+| `powerCycle` | Switches the sensor off for 10 s through its configured smart plug (Shelly or Kasa). Fails if no plug is set. |
 
 ## Validation on the computer
 
@@ -62,3 +64,16 @@ A request is ignored (with a log line, no reply) unless **all** hold:
 - The phone reads replies the same way while a request is pending (timeout 3 min).
 - Cost: ~0.003 test HBAR per message. Testnet resets wipe accounts/topics; Sensor Keeper detects a
   missing topic and asks the user to pair again.
+
+## Relay transport (1.7+)
+
+When the pairing has a relay address, the phone and Sensor Keeper talk over a WebSocket room on the
+Sky Warden relay instead of HCS, so answers come back in seconds.
+
+- Room = hex SHA-256 of `skywarden-room|<shared secret>`; URL `wss://<relay>/ws/<room>?role=phone` (or `role=computer`).
+- Every frame is `base64( AES-256-GCM(JSON) )` (nonce || ciphertext || tag) with AAD
+  `skywarden-relay-v1|<room>`. The relay only forwards frames and can't read them.
+- Request: `{"t":"cmd","id":"<uuid>","client":"<uuid>","ts":<unix s>,"cmd":"check","sensor":"0.0.S","args":{}}`
+- Reply: `{"t":"res","id","client","ok","summary","detail"}`; a `"working":true` reply may come first.
+- Same allowed commands, sensor check, ±5 min timestamp window and replay protection as above; at most 20 requests per hour.
+- The relay may send plain JSON control frames such as `{"computer":false}` (Sensor Keeper not connected).

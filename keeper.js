@@ -26,8 +26,9 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
+const netSock = require('net');
 
-const VERSION = '1.6.0';
+const VERSION = '1.7.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -57,6 +58,7 @@ const DEFAULTS = {
   deviceAutoUpdate: false,    // opt-in: install Air!Squitter software updates (sensors with a status page address)
   communityFixes: false,      // opt-in: install UNOFFICIAL community fixes for Air!Squitter problems (see COMMUNITY_FIXES)
   dryRun: false,
+  autoPowerCycle: true,       // with a smart plug set for a sensor: power-cycle it when it stays unreachable
 };
 
 // ---------------------------------------------------------------- utilities
@@ -283,6 +285,7 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
     try {
       const ds = await getDeviceStatus(sensor.statusUrl);
       st.statusFails = 0;
+      st.statusOkAt = now();
       out.deviceIssues = ds.bad;
       await problem(cfg, st, 'device-down', false, `Sensor Keeper: ${label} status page unreachable`, '');
       // MLAT may be off/unregistered on some sensors: ignore MLAT-only complaints while heartbeats are fine.
@@ -294,6 +297,18 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
       out.deviceIssues = [`status page: ${e.message}`];
       await problem(cfg, st, 'device-down', st.statusFails >= 2, `Sensor Keeper: ${label} status page unreachable`,
         `${sensor.statusUrl} did not answer ${st.statusFails} checks in a row. The sensor may be powered off or off the network.`);
+      // Frozen or off Wi-Fi for good: power-cycle it through its smart plug (at most every 3 h).
+      if (st.statusFails >= 2 && plugOf(sensor) && cfg.autoPowerCycle !== false && !cfg.dryRun && now() - ((st.lastPowerCycle || {}).t || 0) >= POWER_CYCLE_EVERY) {
+        try {
+          const result = await plugPowerCycle(sensor);
+          st.lastPowerCycle = { t: now(), result, by: 'auto' };
+          log(`${label}: unreachable — ${result}`);
+          await sendAlert(cfg, `Sensor Keeper: restarted ${label}`, `${label} stopped answering, so Sensor Keeper ${result}. It should be back in about 5 minutes.`, 'default');
+        } catch (e2) {
+          st.lastPowerCycle = { t: now(), result: `failed: ${e2.message}`, by: 'auto' };
+          log(`${label}: power-cycle failed: ${e2.message}`);
+        }
+      }
     }
   }
 
@@ -1008,10 +1023,74 @@ async function communityFixesAll(cfg, opts = {}) {
 // docs/remote-protocol.md. Off until you run "remote-setup" and "remote-pair".
 let _remote = null;
 function saveRemote(r) { const raw = readJson(CONFIG, {}); raw.remote = r; writePrivate(CONFIG, raw); }
+function saveNetwork(n) { const raw = readJson(CONFIG, {}); raw.network = n; writePrivate(CONFIG, raw); }
+let _network = null;
+function network() {
+  if (!_network) _network = require('./network')({ loadConfig, saveNetwork, log, http });
+  return _network;
+}
 function remote() {
-  if (!_remote) _remote = require('./remote')({ loadConfig, saveRemote, loadState, saveState, log, http, MIRROR, handlers: REMOTE_HANDLERS });
+  if (!_remote) _remote = require('./remote')({ loadConfig, saveRemote, loadState, saveState, log, http, MIRROR, handlers: REMOTE_HANDLERS, networkAccess: () => network().phoneAccess() });
   return _remote;
 }
+// ---------------------------------------------------------------- smart plug (optional)
+// A sensor that froze or lost Wi-Fi for good can't be fixed over the network: only a power
+// cycle helps. With a smart plug on its power adapter, Sensor Keeper can do that itself.
+// sensor.plug = { type: 'shelly' | 'kasa', host: '192.168.x.y' }  (local network, no cloud)
+//   shelly: Gen2+ local HTTP RPC (Switch.Set with toggle_after: the plug turns itself back on)
+//   kasa:   TP-Link Kasa legacy local protocol on TCP 9999 (newer firmware with KLAP isn't supported)
+function kasaCrypt(buf, dec) {
+  let key = 171; const out = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) { const c = buf[i]; const a = key ^ c; key = dec ? c : a; out[i] = a; }
+  return out;
+}
+function kasaSend(host, obj, ms = 6000) {
+  return new Promise((resolve, reject) => {
+    const body = kasaCrypt(Buffer.from(JSON.stringify(obj)), false);
+    const head = Buffer.alloc(4); head.writeUInt32BE(body.length);
+    const sock = netSock.createConnection({ host, port: 9999 });
+    let data = Buffer.alloc(0);
+    const t = setTimeout(() => { sock.destroy(); reject(new Error('plug did not answer')); }, ms);
+    sock.on('connect', () => sock.write(Buffer.concat([head, body])));
+    sock.on('data', (d) => {
+      data = Buffer.concat([data, d]);
+      if (data.length >= 4 && data.length >= 4 + data.readUInt32BE(0)) {
+        clearTimeout(t); sock.end();
+        try { resolve(JSON.parse(kasaCrypt(data.subarray(4, 4 + data.readUInt32BE(0)), true).toString())); } catch (e) { reject(e); }
+      }
+    });
+    sock.on('error', (e) => { clearTimeout(t); reject(e); });
+  });
+}
+function plugOf(sensor) {
+  const p = sensor && sensor.plug;
+  return p && (p.type === 'shelly' || p.type === 'kasa') && /^[a-z0-9.-]+$/i.test(p.host || '') ? p : null;
+}
+async function plugPowerCycle(sensor, offSeconds = 10) {
+  const p = plugOf(sensor);
+  if (!p) throw new Error('no smart plug is set for this sensor');
+  if (p.type === 'shelly') {
+    const r = await http(`http://${p.host}/rpc/Switch.Set?id=0&on=false&toggle_after=${offSeconds}`, {}, 8000);
+    if (!r.ok) throw new Error(`plug answered ${r.status}`);
+    return `power-cycled through the Shelly plug at ${p.host} (off ${offSeconds} s)`;
+  }
+  const off = await kasaSend(p.host, { system: { set_relay_state: { state: 0 } } });
+  if (((off.system || {}).set_relay_state || {}).err_code) throw new Error('plug refused to switch off');
+  await sleep(offSeconds * 1000);
+  await kasaSend(p.host, { system: { set_relay_state: { state: 1 } } });
+  return `power-cycled through the Kasa plug at ${p.host} (off ${offSeconds} s)`;
+}
+async function plugStatus(sensor) {
+  const p = plugOf(sensor);
+  if (!p) return null;
+  try {
+    if (p.type === 'shelly') { const r = await http(`http://${p.host}/rpc/Switch.GetStatus?id=0`, {}, 5000); return r.json ? (r.json.output ? 'on' : 'off') : 'no answer'; }
+    const s = await kasaSend(p.host, { system: { get_sysinfo: {} } }, 5000);
+    return ((s.system || {}).get_sysinfo || {}).relay_state ? 'on' : 'off';
+  } catch (e) { return `no answer (${e.message})`; }
+}
+const POWER_CYCLE_EVERY = 3 * 3600 * 1000;
+
 const REMOTE_HANDLERS = {
   async check(cfg, sensor) {
     const [bal, hb] = await Promise.all([getBalance(sensor.id).catch(() => null), getHeartbeats(sensor.id).catch(() => ({}))]);
@@ -1020,9 +1099,24 @@ const REMOTE_HANDLERS = {
     if (bal && bal.balance != null) parts.push(`${fmt(bal.balance, 0)} HBAR`);
     if (!sensor.statusUrl) return { ok: age != null && age <= cfg.heartbeatAlertMinutes, summary: parts.join(' · '), detail: "No AirSquitter address in Sensor Keeper, so only Hedera data was checked." };
     const f = await diagnoseSensor(cfg, sensor, { heartbeatAgeMin: age }).catch((e) => [{ level: 'warn', text: `Couldn't reach the sensor: ${e.message}` }]);
+    const sst = (loadState().sensors || {})[sensor.id] || {};
+    if (f.some((x) => x.key === 'lan' && x.level === 'bad')) {
+      if (sst.statusOkAt) f.push({ level: 'warn', text: `It last answered this computer at ${new Date(sst.statusOkAt).toLocaleString()}.` });
+      const ps = await plugStatus(sensor);
+      if (ps) f.push({ level: ps === 'on' ? 'warn' : 'bad', text: `Its smart plug is ${ps}. ${ps === 'on' ? 'Power is on, so the sensor has probably frozen or lost Wi-Fi — "Power-cycle" should bring it back.' : ''}` });
+      else f.push({ level: 'warn', text: "Nothing on the network can restart a sensor that froze or lost Wi-Fi. Unplug it for 10 seconds. To let Sensor Keeper do this for you next time, put its power adapter on a Shelly or Kasa smart plug." });
+      if (sst.lastPowerCycle) f.push({ level: 'warn', text: `Sensor Keeper last power-cycled it at ${new Date(sst.lastPowerCycle.t).toLocaleString()}: ${sst.lastPowerCycle.result}.` });
+    }
     const bad = f.filter((x) => x.level === 'bad');
     return { ok: !bad.length, summary: `${parts.join(' · ')} · ${bad.length ? `${bad.length} problem${bad.length > 1 ? 's' : ''}` : 'all checks passed'}`,
       detail: f.map((x) => `${x.level === 'ok' ? '✓' : x.level === 'warn' ? '!' : '✗'} ${x.text}`).join('\n') };
+  },
+  async powerCycle(cfg, sensor) {
+    const result = await plugPowerCycle(sensor);
+    const st = loadState(); const ss = (st.sensors[sensor.id] = st.sensors[sensor.id] || {});
+    ss.lastPowerCycle = { t: now(), result, by: 'app' }; saveState(st);
+    log(`${sensor.name || sensor.id}: ${result} (asked from Sky Warden)`);
+    return { ok: true, summary: `${result.charAt(0).toUpperCase()}${result.slice(1)}. It takes about 5 minutes to come back.` };
   },
   async restart4dsky(cfg, sensor) {
     if (!sensor.statusUrl) throw new Error("this sensor has no AirSquitter address in Sensor Keeper's settings");
@@ -1076,6 +1170,7 @@ async function runLoop() {
   if (cfg.remote && cfg.remote.topic) log(`Sky Warden remote control is on (topic ${cfg.remote.topic})`);
   setInterval(() => { const c = loadConfig(); if (c && c.remote && c.remote.topic) remote().poll().catch(() => {}); }, 5000);
   if (cfg.remote && cfg.remote.relay) remote().relayConnect();
+  network().start();
   let lastCheck = 0;
   let lastUpdateTry = 0;
   const selfFile = selfTarget().file;
@@ -1600,6 +1695,7 @@ function publicConfig(cfg) {
   c.sensors = (c.sensors || []).map(({ devicePassword, ...s }) => ({ ...s, devicePasswordSet: !!devicePassword }));
   c.tokenSet = !!t;
   c.tokenHint = t ? '…' + t.slice(-4) : '';
+  if (c.network) c.network = { url: c.network.url, feederId: c.network.feederId, share: !!c.network.share };
   if (c.remote) c.remote = { control: c.remote.control ? c.remote.control.account : null, topic: c.remote.topic || null, phoneAccount: c.remote.phoneAccount || null, pairedAt: c.remote.pairedAt || null };
   return c;
 }
@@ -2015,7 +2111,12 @@ Usage: ${APP} <command>
   remote-pair         Pair the Sky Warden iPhone app (shows a QR code on this screen)
   remote-relay <url>  Use a Sky Warden relay for live traffic away from home (or "off")
   remote-status       Show the remote-control pairing
+  set-plug <id> shelly|kasa <ip>   Smart plug on a sensor's power, so Sensor Keeper can restart it ("off" to remove)
+  power-cycle <id>    Turn a sensor off and on again through its smart plug
   remote-unpair       Remove the pairing (deletes the command topic)
+  network-join CODE   Share live aircraft with the Sky Warden network map (invite only)
+  network-share on|off  Turn network sharing on or off
+  network-status      Show network sharing status
   logs                Show the last 40 log lines
   version             Print the version
 
@@ -2160,7 +2261,55 @@ async function main() {
       console.log(u && u !== 'off' ? `Relay set to ${u}. Pair the phone again so it learns the relay address.` : 'Relay turned off.');
       return;
     }
+    case 'network-join': {
+      needCfg();
+      const invite = argv[1];
+      if (!invite) { console.error(`Usage: ${APP} network-join <invite-code> [name]`); process.exit(1); }
+      const id = await network().join(invite, argv.slice(2).join(' ') || os.hostname().replace(/\.local$/, ''));
+      console.log(`Joined the Sky Warden network as feeder ${id}. Sharing is on: your sensors' aircraft (never your location) go to the network map.`);
+      console.log('Open Sky Warden and pull to refresh so your phone picks up network access.');
+      return;
+    }
+    case 'network-share': {
+      needCfg();
+      const on = argv[1] === 'on' ? true : argv[1] === 'off' ? false : null;
+      if (on === null) { console.error(`Usage: ${APP} network-share on|off`); process.exit(1); }
+      if (!network().setShare(on)) { console.error(`Not joined yet. Run: ${APP} network-join <invite-code>`); process.exit(1); }
+      console.log(on ? 'Sharing is on.' : 'Sharing is off. (The network map stays free for 24 hours after you last shared.)');
+      return;
+    }
+    case 'network-device-feeder': {
+      // network-device-feeder /path/to/feeder.conf  (the conf baked into the sensor's skywarden-feeder package)
+      needCfg();
+      const f = argv[1];
+      if (!f || !fs.existsSync(f)) { console.error(`Usage: ${APP} network-device-feeder <feeder.conf>`); process.exit(1); }
+      const kv = Object.fromEntries(fs.readFileSync(f, 'utf8').split('\n').map((l) => l.match(/^([A-Z]+)=(.*)$/)).filter(Boolean).map((m) => [m[1], m[2].trim()]));
+      network().useDeviceFeeder(kv.TOKEN, kv.URL);
+      console.log('This computer stopped uploading. The sensor feeds the network itself, and your phone now uses the sensor\'s access (pull to refresh in Sky Warden).');
+      return;
+    }
+    case 'network-status': { console.log(JSON.stringify(network().status(), null, 2)); return; }
     case 'remote-status': { console.log(JSON.stringify(remote().status(), null, 2)); return; }
+    case 'set-plug': {
+      const raw = readJson(CONFIG, null);
+      const s2 = raw && (raw.sensors || []).find((x) => x.id === argv[1]);
+      if (!s2) { console.error(`Usage: ${APP} set-plug <sensor id> shelly|kasa <ip>   (or: set-plug <sensor id> off)`); process.exit(1); }
+      if (argv[2] === 'off') delete s2.plug;
+      else {
+        if (!['shelly', 'kasa'].includes(argv[2]) || !/^[a-z0-9.-]+$/i.test(argv[3] || '')) { console.error(`Usage: ${APP} set-plug <sensor id> shelly|kasa <ip>`); process.exit(1); }
+        s2.plug = { type: argv[2], host: argv[3] };
+      }
+      writePrivate(CONFIG, raw);
+      console.log(s2.plug ? `Plug set. It reports: ${await plugStatus(s2)}` : 'Plug removed.');
+      return;
+    }
+    case 'power-cycle': {
+      const c = needCfg();
+      const s2 = c.sensors.find((x) => x.id === argv[1]);
+      if (!s2) { console.error(`Usage: ${APP} power-cycle <sensor id>`); process.exit(1); }
+      console.log(await plugPowerCycle(s2));
+      return;
+    }
     case 'remote-unpair': { console.log((await remote().unpair()) ? 'Unpaired: the command topic was deleted.' : 'No phone was paired.'); return; }
     default: help();
   }
