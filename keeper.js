@@ -28,7 +28,7 @@ const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const netSock = require('net');
 
-const VERSION = '1.7.2';
+const VERSION = '1.7.3';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -237,8 +237,9 @@ async function reserveSend(cfg, to, amount) {
   } finally { client.close(); }
 }
 
-// The Sky Warden network keeps a shared reserve for when Hedera's faucet is blocked. It tops up real
-// 4DSKY sensors (heartbeats in the last day) that are under 50 HBAR, once a day each. No sign-up.
+// Backup for when Hedera's faucet is blocked: the Sky Warden network can top up real 4DSKY sensors
+// (heartbeats in the last day) that are under 50 HBAR, once a day each. It stays quiet at first; if the
+// block drags on, the owner is told and given a deadline to add HBAR themselves.
 const SHARED_RESERVE_URL = process.env.SENSOR_KEEPER_SHARED_RESERVE || 'https://network.businessrx.ai/v1/reserve/request';
 async function sharedReserve(cfg, id) {
   if (cfg.sharedReserve === false) return { ok: false, error: 'turned off' };
@@ -425,17 +426,28 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
               } else log(`${label}: reserve ${cfg.reserve.account} is too low (${rb.missing ? 'missing' : fmt(rb.balance)} HBAR) to cover a top-up`);
             } catch (e2) { log(`${label}: reserve transfer failed: ${e2.message}`); }
           }
-          // No reserve of your own (or it couldn't cover it): ask the shared Sky Warden reserve when low.
+          // No reserve of your own (or it couldn't cover it): ask the Sky Warden network's backup when low.
           if (!covered && !cfg.dryRun && bal.balance < 50) {
             try {
               const sr = await sharedReserve(cfg, id);
               if (sr.ok) {
                 st.lastTopup = now();
                 covered = true;
-                out.topup = `got ${sr.amount} HBAR from the shared Sky Warden reserve (faucet blocked)`;
-                log(`${label}: faucet blocked, so the shared Sky Warden reserve sent ${sr.amount} HBAR${sr.tx ? `, tx ${sr.tx}` : ''}`);
-              } else log(`${label}: shared Sky Warden reserve: ${sr.error || 'no answer'}`);
-            } catch (e3) { log(`${label}: shared Sky Warden reserve unreachable: ${e3.message}`); }
+                out.topup = `topped up ${sr.amount} HBAR`;
+                log(`${label}: topped up ${sr.amount} HBAR while Hedera's faucet is blocked${sr.tx ? `, tx ${sr.tx}` : ''}`);
+                // Only once the block has lasted a while: tell the owner it's borrowed time, at most every 5 days.
+                if (sr.notice && now() - (st.reserveNoticeAt || 0) > 5 * DAY) {
+                  st.reserveNoticeAt = now();
+                  await sendAlert(cfg, `Sensor Keeper: please add HBAR to ${label} soon`, sr.notice, 'high');
+                }
+              } else {
+                log(`${label}: backup top-up not available: ${sr.error || 'no answer'}`);
+                if (sr.phase === 'over' && now() - (st.reserveOverAt || 0) > 2 * DAY) {
+                  st.reserveOverAt = now();
+                  await sendAlert(cfg, `Sensor Keeper: ${label} needs HBAR from you`, `${sr.error}\nBalance is ${fmt(bal.balance)} HBAR.`, 'high');
+                }
+              }
+            } catch (e3) { log(`${label}: backup top-up unreachable: ${e3.message}`); }
           }
           // Only bother you when it starts to matter: under two weeks of HBAR left and nothing covered it.
           const daysLeft = st.burnPerDay ? bal.balance / st.burnPerDay : null;
