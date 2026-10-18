@@ -17,7 +17,7 @@ jobs:
       - name: Check syntax
         run: node --check keeper.js
       - name: Install dependencies
-        run: npm ci --omit=dev --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Compile standalone programs
         run: |
           mkdir -p dist
@@ -25,7 +25,9 @@ jobs:
             ext=""; [ "$t" = windows-x64 ] && ext=".exe"
             bun build keeper.js --compile --minify --target=bun-$t --outfile dist/sensor-keeper-$t$ext
           done
-          cp keeper.js install.sh install.ps1 dist/
+          # keeper.js for Node installs (Raspberry Pi etc.): one bundled file with its libraries inside
+          npx esbuild keeper.js --bundle --platform=node --target=node18 --outfile=dist/keeper.js --legal-comments=none
+          cp install.sh install.ps1 dist/
           chmod +x "click-installers/Install Sensor Keeper (Mac).command" install.sh
           (cd click-installers && zip -q "../dist/Sensor-Keeper-Mac-installer.zip" "Install Sensor Keeper (Mac).command" \
              && zip -q "../dist/Sensor-Keeper-Windows-installer.zip" "Install Sensor Keeper (Windows).bat")
