@@ -13,7 +13,7 @@ const crypto = require('crypto');
 const PROTO = 'skywarden-remote-v1';
 const ALLOWED = ['check', 'restart4dsky', 'applyFix', 'traffic', 'powerCycle'];
 const MAX_SKEW_S = 300;
-const MAX_PER_HOUR = 10;
+const MAX_PER_HOUR = 20;   // remote commands per hour, relay and Hedera together (1.8.1: shared and saved)
 const MAX_PLAINTEXT = 640;   // keeps every message in a single 1 KB HCS chunk
 
 function sdk() { return require('@hashgraph/sdk'); }
@@ -141,6 +141,14 @@ module.exports = function createRemote(k) {
     } finally { c.close(); }
   }
 
+  // One hourly limit for remote commands from both paths, kept on disk.
+  function takeHit() {
+    const rp = k.loadReplay();
+    rp.hits = rp.hits.filter((t) => Date.now() - t < 3600e3);
+    if (rp.hits.length >= MAX_PER_HOUR) { k.saveReplay(rp); return false; }
+    rp.hits.push(Date.now()); k.saveReplay(rp); return true;
+  }
+
   let busy = false;
   async function poll() {
     if (busy) return;
@@ -165,10 +173,8 @@ module.exports = function createRemote(k) {
         if (req.t !== 'req' || typeof req.id !== 'string' || Math.abs((req.ts || 0) - cts) > MAX_SKEW_S) { k.log('remote: ignored a stale or malformed request'); continue; }
         if (rs.seen.includes(req.id)) continue;
         rs.seen = [...rs.seen, req.id].slice(-200);
-        rs.hits = rs.hits.filter((t) => Date.now() - t < 3600e3);
         const reply = (o) => send(rc, { t: 'rep', id: req.id, ts: Math.floor(Date.now() / 1000), ...o });
-        if (rs.hits.length >= MAX_PER_HOUR) { await reply({ ok: false, summary: 'Too many requests this hour — try again later.' }); continue; }
-        rs.hits.push(Date.now());
+        if (!takeHit()) { k.saveState(st); await reply({ ok: false, summary: 'Too many requests this hour — try again later.' }); continue; }
         k.saveState(st);
         const sensor = (cfg.sensors || []).find((s) => s.id === req.sensor);
         if (!ALLOWED.includes(req.cmd) || !sensor) { await reply({ ok: false, summary: 'Not allowed: unknown command or sensor.' }); continue; }
@@ -228,15 +234,14 @@ module.exports = function createRemote(k) {
     }
   }
 
-  const relaySeen = [];
-  let relayHits = [];
   async function runRelayCmd(cur, m) {
     const reply = (o) => sendRelay(cur.rc, { t: 'res', id: m.id, client: m.client, ts: Math.floor(Date.now() / 1000), ...o });
-    if (relaySeen.includes(m.id) || Math.abs((m.ts || 0) - Date.now() / 1000) > MAX_SKEW_S) return;
-    relaySeen.push(m.id); if (relaySeen.length > 200) relaySeen.shift();
-    relayHits = relayHits.filter((t) => Date.now() - t < 3600e3);
-    if (relayHits.length >= MAX_PER_HOUR * 2) { reply({ ok: false, summary: 'Too many requests this hour — try again later.' }); return; }
-    relayHits.push(Date.now());
+    if (typeof m.id !== 'string' || Math.abs((m.ts || 0) - Date.now() / 1000) > MAX_SKEW_S) return;
+    // 1.8.1: seen command ids and the hourly limit are saved, so a restart can't be used to replay a command.
+    const rp = k.loadReplay();
+    if (rp.seen.includes(m.id)) return;
+    rp.seen = [...rp.seen, m.id].slice(-500); k.saveReplay(rp);
+    if (!takeHit()) { reply({ ok: false, summary: 'Too many requests this hour — try again later.' }); return; }
     const sensor = (cur.cfg.sensors || []).find((s) => s.id === m.sensor);
     if (!ALLOWED.includes(m.cmd) || !sensor) { reply({ ok: false, summary: 'Not allowed: unknown command or sensor.' }); return; }
     k.log(`remote: ${m.cmd} for ${sensor.name || sensor.id} requested from Sky Warden (relay)`);

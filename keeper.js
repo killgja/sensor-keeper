@@ -28,7 +28,7 @@ const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const netSock = require('net');
 
-const VERSION = '1.8.0';
+const VERSION = '1.8.1';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -83,6 +83,9 @@ function writePrivate(file, data) {
   fs.writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
   try { fs.chmodSync(file, 0o600); } catch { /* windows */ }
+  if (process.platform === 'win32' && process.env.USERNAME) {   // 1.8.1: chmod does nothing on Windows
+    try { execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${process.env.USERNAME}:F`], { stdio: 'ignore', windowsHide: true }); } catch { /* best effort */ }
+  }
 }
 // config.json exists but isn't valid JSON (hand edit, disk problem). Don't treat it as "not set up".
 // BUG-003 (skywarden): valid JSON with the wrong shape (sensors not a list, null entries...) crashed
@@ -116,6 +119,11 @@ function loadState() {
   return readJson(STATE, { sensors: {}, faucetLedger: [], lastSummary: 0 });
 }
 function saveState(s) { writePrivate(STATE, s); }
+// Remote-command replay guard (1.8.1): ids already run and the hourly count, in their own small file so the
+// main loop's state saves can't overwrite them.
+const REPLAY = path.join(HOME, 'remote-seen.json');
+function loadReplay() { const r = readJson(REPLAY, null) || {}; return { seen: Array.isArray(r.seen) ? r.seen : [], hits: Array.isArray(r.hits) ? r.hits : [] }; }
+function saveReplay(r) { writePrivate(REPLAY, r); }
 
 function log(msg) {
   const line = `${iso()} ${msg}`;
@@ -602,8 +610,12 @@ async function selfUpdate(cfg, { force = false } = {}) {
     const assets = r.json.assets || [];
     const a = assets.find((x) => x.name === tgt.asset);
     const sums = assets.find((x) => x.name === 'SHA256SUMS.txt');
+    const sig = assets.find((x) => x.name === 'SHA256SUMS.txt.sig');
     if (!a || !sums) return { updated: false, version: latest, reason: `release v${latest} is missing ${!a ? tgt.asset : 'SHA256SUMS.txt'}` };
-    const [bin, sumText] = [await download(a.browser_download_url), (await download(sums.browser_download_url)).toString('utf8')];
+    if (!sig) return { updated: false, version: latest, reason: `release v${latest} isn't signed yet - will try again later` };
+    const [bin, sumBuf, sigText] = [await download(a.browser_download_url), await download(sums.browser_download_url), (await download(sig.browser_download_url)).toString('utf8')];
+    if (!signedBy(sumBuf, sigText)) return { updated: false, version: latest, reason: `release v${latest} has a bad signature - not installed` };
+    const sumText = sumBuf.toString('utf8');
     const want = (sumText.split('\n').map((l) => l.trim().split(/\s+\*?/)).find((p) => p[1] === tgt.asset) || [])[0];
     const got = require('crypto').createHash('sha256').update(bin).digest('hex');
     if (!want || want.toLowerCase() !== got) return { updated: false, version: latest, reason: `checksum mismatch for ${tgt.asset} — not installed` };
@@ -659,6 +671,27 @@ function restartSelf() {
 // (saved only in config.json).
 const JV_HISTORY = process.env.SENSOR_KEEPER_JV_HISTORY || 'https://wiki.jetvision.de/wiki/Radarcape:Version_History';
 const DEVICE_MANIFEST = process.env.SENSOR_KEEPER_DEVICE_MANIFEST || `https://raw.githubusercontent.com/${REPO}/main/device-updates.json`;
+// 1.8.1: releases (SHA256SUMS.txt.sig) and device-updates.json (device-updates.json.sig) must be signed with
+// the Sky Warden release key (Ed25519, kept offline on the maintainer's Mac). A change to the GitHub repo
+// alone can't make Sensor Keeper install a new version or put a package on a sensor.
+const SIGNING_PUBKEY = process.env.SENSOR_KEEPER_DEVICE_MANIFEST && process.env.SENSOR_KEEPER_SIGNING_PUBKEY
+  ? process.env.SENSOR_KEEPER_SIGNING_PUBKEY   // tests with a local manifest only
+  : '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAIn+HiXl1K7chMOtwES5HUn/46r++NYw2BFsPoeoYWAI=\n-----END PUBLIC KEY-----'.replace(/\\n/g, '\n');
+function signedBy(data, sigText) {
+  try { return require('crypto').verify(null, Buffer.isBuffer(data) ? data : Buffer.from(String(data)), SIGNING_PUBKEY, Buffer.from(String(sigText || '').trim(), 'base64')); }
+  catch { return false; }
+}
+let manifestCache = null, warnedManifest = false;
+/** device-updates.json, only if its signature checks out (cached 10 min). Same shape as http(). */
+async function fetchManifest() {
+  if (manifestCache && now() - manifestCache.t < 10 * 60e3) return manifestCache.r;
+  const [m, s] = await Promise.all([http(DEVICE_MANIFEST, {}, 15000), http(`${DEVICE_MANIFEST}.sig`, {}, 15000).catch(() => ({ ok: false }))]);
+  let r = { ok: false, status: m.status, json: null, text: '' };
+  if (m.ok && s.ok && signedBy(m.text, s.text)) r = m;
+  else if (m.ok && !warnedManifest) { warnedManifest = true; log('device-updates.json has no valid signature - ignoring it (no device updates or 4DSKY reinstalls from it)'); }
+  manifestCache = { t: now(), r };
+  return r;
+}
 const DEVICE_UPDATE_EVERY = 6 * 3600 * 1000;
 const DEVICE_UPDATE_TIMEOUT = 60 * 60 * 1000;
 const JV_VER = /\b(\d{6}\.\d{4}\.\d{2})\b/g;
@@ -712,7 +745,7 @@ async function latestPublished() {
     }
   } catch { /* offline: fine */ }
   try {
-    const r = await http(DEVICE_MANIFEST, {}, 15000);
+    const r = await fetchManifest();
     const a = r.ok && r.json && r.json.airsquitter;
     if (a && /^\d{6}\.\d{4}\.\d{2}$/.test(a.version || '')) out.pinned = { version: a.version, note: a.note || '' };
   } catch { /* fine */ }
@@ -1029,7 +1062,8 @@ const COMMUNITY_FIXES = [
       }
       log(`${label}: 4DSKY probe: package ${pkg || '?'}, service ${fx.probe.svc || '?'}${fx.probe.restarted ? `, restarted -> ${fx.probe.after || '?'}` : ''}`);
       if (pkg !== 'missing') return fx.probe.restarted ? 'restarted the 4DSKY program' : 'the 4DSKY program is installed and running';
-      const r = await http(DEVICE_MANIFEST, {}, 15000);
+      if (fx.remote && cfg.communityFixes !== true) throw new Error('the 4DSKY program is missing on the sensor. Reinstalling it from the app needs "Community fixes" turned on in Sensor Keeper\'s settings');
+      const r = await fetchManifest();
       const n = r.ok && r.json && r.json.neuronSdk;
       if (!n || !n.url || !/^[0-9a-f]{64}$/.test(n.sha256 || '')) throw new Error('the 4DSKY program is missing, but no official package is pinned in device-updates.json');
       const buf = await download(n.url, 300000);
@@ -1080,7 +1114,7 @@ const FIX_VERIFY_AFTER = 5 * 60 * 1000;
 
 async function retiredFixes() {
   try {
-    const r = await http(DEVICE_MANIFEST, {}, 15000);
+    const r = await fetchManifest();
     return (r.ok && r.json && Array.isArray(r.json.retiredFixes)) ? r.json.retiredFixes : [];
   } catch { return []; }
 }
@@ -1201,7 +1235,7 @@ function network() {
   return _network;
 }
 function remote() {
-  if (!_remote) _remote = require('./remote')({ loadConfig, saveRemote, loadState, saveState, log, http, MIRROR, handlers: REMOTE_HANDLERS, networkAccess: () => network().phoneAccess() });
+  if (!_remote) _remote = require('./remote')({ loadConfig, saveRemote, loadState, saveState, loadReplay, saveReplay, log, http, MIRROR, handlers: REMOTE_HANDLERS, networkAccess: () => network().phoneAccess() });
   return _remote;
 }
 // ---------------------------------------------------------------- smart plug (optional)
@@ -1291,8 +1325,14 @@ const REMOTE_HANDLERS = {
   },
   async restart4dsky(cfg, sensor) {
     if (!sensor.statusUrl) throw new Error("this sensor has no AirSquitter address in Sensor Keeper's settings");
+    // 1.8.1: a restart from the app uses only the repair probe bundled in Sensor Keeper (checksum pinned in this
+    // file). Reinstalling a missing 4DSKY package needs the "Community fixes" opt-in (see neuron-sdk-repair).
+    if (cfg.dryRun) return { ok: true, summary: 'Dry run: would restart the 4DSKY program.' };
+    const st = loadState(); const ss = (st.sensors[sensor.id] = st.sensors[sensor.id] || {});
+    if (ss.lastRemoteRestart && now() - ss.lastRemoteRestart < 30 * 60e3) return { ok: false, summary: 'Restarted from the app less than 30 minutes ago - give it a few more minutes.' };
+    ss.lastRemoteRestart = now(); saveState(st);
     const fix = COMMUNITY_FIXES.find((f) => f.id === 'neuron-sdk-repair');
-    const did = await fix.run(cfg, sensor, sensor.name || sensor.id, {});
+    const did = await fix.run(cfg, sensor, sensor.name || sensor.id, { remote: true });
     return { ok: true, summary: `${did.charAt(0).toUpperCase()}${did.slice(1)}.` };
   },
   // Snapshot of the aircraft the sensor hears right now (from its own aircraftlist.json).
@@ -1313,6 +1353,10 @@ const REMOTE_HANDLERS = {
     const fix = COMMUNITY_FIXES.find((f) => f.id === args.fix);
     if (!fix || !sensor.statusUrl) throw new Error('unknown fix, or no AirSquitter address for this sensor');
     const st = loadState();
+    const ss = (st.sensors[sensor.id] = st.sensors[sensor.id] || {});
+    const last = (ss.remoteFix || {})[fix.id] || 0;
+    if (now() - last < 6 * 3600e3) return { ok: false, summary: 'That fix was already run from the app in the last 6 hours.' };
+    ss.remoteFix = { ...(ss.remoteFix || {}), [fix.id]: now() };
     const r = await applyFix(cfg, st, sensor, fix, { force: true });
     saveState(st);
     return { ok: !/fail/i.test(r), summary: r };
@@ -1563,7 +1607,7 @@ Step 4 — alerts (optional, but recommended)
     (anyone who knows it can read your alerts), and enter the same name here.
 `);
   cfg.alerts.discordWebhook = await ask(rl, '  Discord webhook URL (Enter to skip)', old.alerts.discordWebhook || '');
-  const suggested = old.alerts.ntfyTopic || `sensor-keeper-${Math.random().toString(36).slice(2, 10)}`;
+  const suggested = old.alerts.ntfyTopic || `sensor-keeper-${require('crypto').randomBytes(9).toString('base64url').toLowerCase().replace(/[^a-z0-9]/g, '')}`;
   const useNtfy = await askYesNo(rl, '  Use ntfy for phone push alerts?', !!old.alerts.ntfyTopic);
   if (useNtfy) {
     for (;;) {
@@ -1903,6 +1947,10 @@ async function runUi() {
   const crypto = require('crypto');
   ensureHome();
   const key = crypto.randomBytes(18).toString('hex');
+  // 1.8.1: the browser is opened with a one-time code (good for 5 minutes, first use only), not the session
+  // key, so the key never lands in ui.log, the terminal or another user's process list. The first page load
+  // sets an HttpOnly cookie; the API still needs the x-sk-key header.
+  let openCode = crypto.randomBytes(18).toString('hex'); const openCodeUntil = now() + 5 * 60e3;
   // Standalone builds store the page's special characters (→ — …) as \uXXXX
   // escapes; turn them back into real characters before serving.
   const PAGE = UI_HTML.replace(/\\u([0-9a-fA-F]{4})/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
@@ -1923,9 +1971,14 @@ async function runUi() {
     if (!['127.0.0.1', 'localhost'].includes(host)) { res.writeHead(403); return res.end(); }
     const url = new URL(req.url, 'http://127.0.0.1');
     if (req.method === 'GET' && url.pathname === '/') {
-      if (url.searchParams.get('k') !== key) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('Open Sensor Keeper from its app icon or with "sensor-keeper ui".'); }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY',
-        'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:" });
+      const cookie = ((req.headers.cookie || '').match(/(?:^|;\s*)sk=([0-9a-f]{36})/) || [])[1];
+      const code = url.searchParams.get('c');
+      const byCode = openCode && code && code === openCode && now() < openCodeUntil;
+      if (byCode) openCode = null;   // one use
+      if (!byCode && cookie !== key) { res.writeHead(403, { 'Content-Type': 'text/plain' }); return res.end('Open Sensor Keeper from its app icon or with "sensor-keeper ui".'); }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+        'Set-Cookie': `sk=${key}; HttpOnly; SameSite=Strict; Path=/`,
+        'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });
       return res.end(PAGE.replace('__KEY__', key).replace('__VERSION__', VERSION));
     }
     if (!url.pathname.startsWith('/api/')) { res.writeHead(404); return res.end(); }
@@ -2058,8 +2111,8 @@ async function runUi() {
   });
 
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const url = `http://127.0.0.1:${server.address().port}/?k=${key}`;
-  console.log(`Sensor Keeper is open in your browser. If it didn't open, visit:\n  ${url}\n(Leave this running while you use it; it closes itself after the window is closed.)`);
+  const url = `http://127.0.0.1:${server.address().port}/?c=${openCode}`;
+  console.log(`Sensor Keeper is open in your browser. If it didn't open, visit (works once, for 5 minutes):\n  ${url}\n(Leave this running while you use it; it closes itself after the window is closed.)`);
   if (!process.argv.includes('--no-open')) openBrowser(url);
   setInterval(() => { if (now() - lastPing > 120000) { server.close(); process.exit(0); } }, 15000).unref();
 }
@@ -2293,7 +2346,7 @@ function markDirty(){dirty=true;$('saveNote').textContent='Unsaved changes';}
 $('topupsOn').addEventListener('change',function(){$('topupBox').classList.toggle('hidden',!this.checked);});
 ['topupsOn','token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd','cfix'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
 $('addSensor').onclick=function(){$('sensorList').appendChild(sensorRow({id:'',name:'',statusUrl:''}));markDirty();};
-$('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-';for(var i=0;i<10;i++)r+=a[Math.floor(Math.random()*a.length)];$('ntfy').value=r;markDirty();};
+$('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-',b=new Uint8Array(20);crypto.getRandomValues(b);for(var i=0;i<20;i++)r+=a[b[i]%a.length];$('ntfy').value=r;markDirty();};
 $('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim(),devicePassword:d.querySelector('.spw').value,clearPassword:!!(d.querySelector('.spwreset')&&d.querySelector('.spwreset').checked)});});
   api('save',{sensors:sensors,topups:$('topupsOn').checked,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked,communityFixes:$('cfix').checked})
   .then(function(){toast(S.service.running?'Saved. The background service picks up the changes within a minute.':'Saved. Now start the background service (step 5).');return refresh(true);}).catch(function(e){toast(e.message,9000);$('saveNote').textContent=e.message;}).then(function(){b.disabled=false;});};

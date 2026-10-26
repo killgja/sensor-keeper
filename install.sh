@@ -12,6 +12,29 @@ mkdir -p "$DIR"; chmod 700 "$HOME/.sensor-keeper"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 fetch() { if command -v curl >/dev/null; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi; }
+# 1.8.1: check every download against the release's SHA256SUMS.txt, and check that file's signature
+# (Sky Warden release key) where OpenSSL 3 is available.
+PUBKEY='-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAIn+HiXl1K7chMOtwES5HUn/46r++NYw2BFsPoeoYWAI=\n-----END PUBLIC KEY-----'
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+SUMS="$DIR/.sums.$$"
+get_sums() {
+  [ -s "$SUMS" ] && return 0
+  fetch "$BASE/SHA256SUMS.txt" "$SUMS" || { echo "Couldn't download SHA256SUMS.txt from the release."; return 1; }
+  if command -v openssl >/dev/null && openssl version 2>/dev/null | grep -q '^OpenSSL [3-9]'; then
+    if fetch "$BASE/SHA256SUMS.txt.sig" "$SUMS.sig" 2>/dev/null; then
+      printf '%b\n' "$PUBKEY" > "$SUMS.pub"; base64 -d < "$SUMS.sig" > "$SUMS.bin" 2>/dev/null || openssl base64 -d -A < "$SUMS.sig" > "$SUMS.bin"
+      openssl pkeyutl -verify -pubin -inkey "$SUMS.pub" -rawin -in "$SUMS" -sigfile "$SUMS.bin" >/dev/null 2>&1 \
+        || { echo "The release's signature is wrong - not installing."; rm -f "$SUMS"*; return 1; }
+      echo "Release signature OK."
+    else echo "(This release isn't signed yet; checking checksums only.)"; fi
+  fi
+}
+verify() {  # verify FILE ASSET-NAME
+  get_sums || return 1
+  want=$(awk -v f="$2" '$2==f || $2=="*"f {print $1}' "$SUMS")
+  [ -n "$want" ] && [ "$want" = "$(sha256 "$1")" ] || { echo "Checksum mismatch for $2 - not installing."; return 1; }
+}
+trap 'rm -f "$SUMS" "$SUMS".sig "$SUMS".pub "$SUMS".bin' EXIT
 
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os/$arch" in
@@ -24,6 +47,7 @@ esac
 
 say "Installing Sensor Keeper for $os/$arch…"
 if [ -n "$asset" ] && fetch "$BASE/$asset" "$DIR/sensor-keeper.tmp"; then
+  verify "$DIR/sensor-keeper.tmp" "$asset" || { rm -f "$DIR/sensor-keeper.tmp"; exit 1; }
   mv "$DIR/sensor-keeper.tmp" "$DIR/sensor-keeper"
   chmod 755 "$DIR/sensor-keeper"
   [ "$os" = Darwin ] && xattr -d com.apple.quarantine "$DIR/sensor-keeper" 2>/dev/null || true
@@ -35,7 +59,9 @@ else
     echo "Install Node.js (e.g. 'sudo apt install nodejs' or https://nodejs.org) and run this again."
     exit 1
   fi
-  fetch "$BASE/keeper.js" "$DIR/keeper.js"
+  fetch "$BASE/keeper.js" "$DIR/keeper.js.tmp"
+  verify "$DIR/keeper.js.tmp" keeper.js || { rm -f "$DIR/keeper.js.tmp"; exit 1; }
+  mv "$DIR/keeper.js.tmp" "$DIR/keeper.js"
   printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v node)" "$DIR/keeper.js" > "$DIR/sensor-keeper"
   chmod 755 "$DIR/sensor-keeper"
   TARGET="$DIR/sensor-keeper"

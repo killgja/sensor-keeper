@@ -11,6 +11,12 @@ New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 Write-Host 'Installing Sensor Keeper...' -ForegroundColor Cyan
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$Repo/releases/latest/download/sensor-keeper-windows-x64.exe" -OutFile "$Exe.tmp"
+# 1.8.1: check the download against the release's SHA256SUMS.txt before installing it.
+$sums = (Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$Repo/releases/latest/download/SHA256SUMS.txt").Content
+if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+$want = ($sums -split "`n" | Where-Object { $_ -match '\s\*?sensor-keeper-windows-x64\.exe\s*$' } | ForEach-Object { ($_ -split '\s+')[0] }) | Select-Object -First 1
+$got = (Get-FileHash -Algorithm SHA256 "$Exe.tmp").Hash.ToLower()
+if (-not $want -or $want.ToLower() -ne $got) { Remove-Item -Force "$Exe.tmp"; throw 'Checksum mismatch - Sensor Keeper was not installed.' }
 Move-Item -Force "$Exe.tmp" $Exe
 Unblock-File $Exe
 
