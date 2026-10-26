@@ -1,6 +1,8 @@
-# Sensor Keeper
+# Sensor Keeper by Sky Warden Flight Tracker
 
-**Keeps your 4DSKY / Neuron sensor online by topping up its Hedera testnet HBAR automatically.**
+**Keeps an eye on your 4DSKY / Neuron sensor from inside your home network, and shows you everything it sees.**
+
+What it adds, with screenshots: **https://network.businessrx.ai/sensor-keeper**
 
 Every 4DSKY sensor (Jetvision Air!Squitter and others) sends a heartbeat to the Hedera
 testnet about every 40 seconds. Each heartbeat costs a tiny fee in *test* HBAR — roughly
@@ -10,11 +12,13 @@ as offline, and it stops earning points.
 Sensor Keeper runs quietly on any always-on computer (Mac, Windows, Linux, Raspberry Pi) and:
 
 - checks each sensor's balance and heartbeats every 30 minutes (Hedera's public mirror node, read-only),
-- tops the sensor up through **Hedera's official Faucet API** when it runs low,
+- warns you a few days before the HBAR balance runs low (the **Sky Warden app** does the top-ups; Sensor Keeper can also do them from your computer if you turn that on),
 - optionally checks a Jetvision Air!Squitter's status page on your network,
 - checks that each sensor is **listed as available to buyers** in Neuron's on-chain seller registry (read-only),
 - alerts you (Discord or phone push) **only** when something needs attention,
 - sends an optional weekly "all good" summary,
+- keeps a private **My station** logbook of every aircraft your sensor hears, with your coverage map and farthest catch (1.8+),
+- sends optional **hobby alerts**: a new range record, or a plane on your watch list coming into range (1.8+),
 - can **keep itself up to date** and **install Air!Squitter software updates** for you (both optional, off by default).
 
 No Claude, no AI, no accounts with us. Nothing costs money — testnet HBAR is free and has no value.
@@ -23,10 +27,11 @@ No Claude, no AI, no accounts with us. Nothing costs money — testnet HBAR is f
 
 ---
 
-## Before you install: get a Hedera Portal access token (2 minutes)
+## Before you install
 
-Top-ups come from Hedera's free faucet, which needs a token tied to your own free Hedera
-Portal account.
+**HBAR top-ups:** the Sky Warden app tops up your sensor automatically (open your device in the app → HBAR top-ups),
+so most owners don't need Sensor Keeper for this. If you also want this computer to top up (as a backup, or
+without the app), get a free Hedera Portal access token first:
 
 1. Go to **https://portal.hedera.com** and sign in (or create a free account).
 2. Open your account settings and create a **Personal Access Token**.

@@ -1,19 +1,25 @@
 {
   "name": "sensor-keeper",
-  "version": "1.7.3",
+  "version": "1.8.0",
   "private": true,
   "description": "Keeps 4DSKY / Neuron sensors funded and healthy. Optional Sky Warden remote control over Hedera.",
   "main": "keeper.js",
-  "bin": { "sensor-keeper": "keeper.js" },
+  "bin": {
+    "sensor-keeper": "keeper.js"
+  },
   "scripts": {
     "build": "esbuild keeper.js --bundle --platform=node --target=node18 --outfile=dist/keeper.js --legal-comments=none"
   },
   "dependencies": {
-    "@hashgraph/sdk": "^2.50.0",
+    "@hashgraph/sdk": "^2.81.0",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0"
+    "esbuild": "^0.28.2"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "overrides": {
+    "protobufjs": "^7.6.5",
+    "@grpc/grpc-js": "^1.13.6"
+  }
 }

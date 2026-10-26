@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * Sensor Keeper — keeps 4DSKY / Neuron sensors funded with Hedera testnet HBAR.
+ * Sensor Keeper by Sky Warden Flight Tracker — keeps 4DSKY / Neuron sensors funded with Hedera testnet HBAR.
  *
  * Unofficial community tool. Not affiliated with 4DSKY, Neuron or Hedera.
  * Requires Node.js 18+ (22+ for the Sky Warden live-traffic relay). Release builds bundle
@@ -28,7 +28,7 @@ const readline = require('readline');
 const { execFileSync, spawn } = require('child_process');
 const netSock = require('net');
 
-const VERSION = '1.7.3';
+const VERSION = '1.8.0';
 const APP = 'sensor-keeper';
 const HOME = process.env.SENSOR_KEEPER_HOME || path.join(os.homedir(), '.sensor-keeper');
 const CONFIG = path.join(HOME, 'config.json');
@@ -77,14 +77,37 @@ function readJson(file, fallback) {
 }
 function writePrivate(file, data) {
   ensureHome();
+  // keep the last good settings so a damaged config.json can be restored (BUG-001 skywarden)
+  if (file === CONFIG) { try { JSON.parse(fs.readFileSync(CONFIG, 'utf8')); fs.copyFileSync(CONFIG, CONFIG + '.bak'); } catch { /* none yet, or damaged: keep the old .bak */ } }
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, typeof data === 'string' ? data : JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, file);
   try { fs.chmodSync(file, 0o600); } catch { /* windows */ }
 }
+// config.json exists but isn't valid JSON (hand edit, disk problem). Don't treat it as "not set up".
+// BUG-003 (skywarden): valid JSON with the wrong shape (sensors not a list, null entries...) crashed
+// status/check or checked "undefined" accounts. Treat it as damaged too.
+function configShapeProblem(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return 'settings are not an object';
+  if (c.sensors !== undefined && !Array.isArray(c.sensors)) return '"sensors" is not a list';
+  const i = (c.sensors || []).findIndex((x) => !x || typeof x !== 'object' || typeof x.id !== 'string');
+  if (i >= 0) return `sensor #${i + 1} has no account id`;
+  if (c.alerts !== undefined && (c.alerts === null || typeof c.alerts !== 'object')) return '"alerts" is not an object';
+  return null;
+}
+function configDamaged() {
+  if (!fs.existsSync(CONFIG)) return null;
+  try { return configShapeProblem(JSON.parse(fs.readFileSync(CONFIG, 'utf8'))); } catch (e) { return e.message; }
+}
+let warnedDamaged = false;
 function loadConfig() {
-  const c = readJson(CONFIG, null);
-  if (!c) return null;
+  let c = readJson(CONFIG, null);
+  if (c !== null && configShapeProblem(c)) c = null;
+  if (!c) {
+    const bad = configDamaged();
+    if (bad && !warnedDamaged) { warnedDamaged = true; log(`settings file ${CONFIG} is damaged (${bad}). Fix it, or restore ${CONFIG}.bak if it exists. Sensors are NOT being watched until then.`); }
+    return null;
+  }
   const cfg = { ...DEFAULTS, ...c, alerts: { ...DEFAULTS.alerts, ...(c.alerts || {}) } };
   if (DRY_RUN) cfg.dryRun = true;
   return cfg;
@@ -182,6 +205,10 @@ function faucetUsed24h(state) {
   state.faucetLedger = (state.faucetLedger || []).filter((e) => e.t > cutoff);
   return state.faucetLedger.reduce((a, e) => a + e.amount, 0);
 }
+
+// HBAR top-ups from this computer. The Sky Warden app does this for owners, so Sensor Keeper only
+// tops up when you turn it on (setups from before 1.8 that already have a Portal token keep it on).
+function topupsOn(cfg) { return !!cfg && (cfg.topups === true || (cfg.topups == null && !!cfg.portalToken)); }
 
 async function requestFaucet(cfg, state, id, amount) {
   if (!cfg.portalToken) throw new Error('no Hedera Portal access token configured (run setup)');
@@ -373,7 +400,9 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
   }
 
   // 4. top-up
-  const needs = forceTopup || bal.balance < cfg.lowWater;
+  const doTopups = topupsOn(cfg);
+  if (forceTopup && !doTopups) out.topup = 'off on this computer (the Sky Warden app tops up your sensor; turn it on in Settings to do it from here too)';
+  const needs = doTopups && (forceTopup || bal.balance < cfg.lowWater);
   if (needs) {
     const used = faucetUsed24h(state);
     const lastForThis = st.lastTopup || 0;
@@ -470,7 +499,12 @@ async function checkSensor(cfg, state, sensor, { forceTopup = false } = {}) {
   }
   const critical = st.burnPerDay ? bal.balance / st.burnPerDay < 1 : bal.balance < 7;
   await problem(cfg, st, 'low', critical, `Sensor Keeper: ${label} almost out of HBAR`,
-    `Balance ${fmt(bal.balance)} HBAR — less than a day of heartbeats left and automatic top-up hasn't fixed it.`);
+    doTopups ? `Balance ${fmt(bal.balance)} HBAR — less than a day of heartbeats left and automatic top-up hasn't fixed it.`
+      : `Balance ${fmt(bal.balance)} HBAR — less than a day of heartbeats left. In the Sky Warden app, open your device and check that HBAR top-ups are on (or add HBAR at portal.hedera.com/faucet).`);
+  // With top-ups left to the Sky Warden app: a heads-up a few days before it runs dry.
+  const daysLeftNow = st.burnPerDay ? bal.balance / st.burnPerDay : null;
+  await problem(cfg, st, 'lowSoon', !doTopups && !critical && daysLeftNow !== null && daysLeftNow < 3, `Sensor Keeper: ${label} is running low on HBAR`,
+    `Balance ${fmt(bal.balance)} HBAR (~${fmt(daysLeftNow, 1)} days left). Top-ups come from the Sky Warden app: open your device there and check that HBAR top-ups are on.`);
   return out;
 }
 
@@ -490,7 +524,7 @@ async function checkAll(cfg, opts = {}) {
 // Keep the reserve topped up with faucet allowance your sensors didn't need today (refillTo > 0).
 async function maybeRefillReserve(cfg, state) {
   const r = cfg.reserve;
-  if (!r || !r.account || !(r.refillTo > 0) || cfg.dryRun || !cfg.portalToken) return;
+  if (!r || !r.account || !(r.refillTo > 0) || cfg.dryRun || !cfg.portalToken || !topupsOn(cfg)) return;
   if (state.faucetBlockedAt && now() - state.faucetBlockedAt < 6 * 3600 * 1000) return;
   if (now() - (state.reserveRefillAt || 0) < DAY) return;
   const left = Math.floor(FAUCET_DAILY_LIMIT - faucetUsed24h(state));
@@ -1142,8 +1176,25 @@ async function communityFixesAll(cfg, opts = {}) {
 // Lets the Sky Warden iPhone app ask for a few fixed actions over Hedera (testnet). See
 // docs/remote-protocol.md. Off until you run "remote-setup" and "remote-pair".
 let _remote = null;
-function saveRemote(r) { const raw = readJson(CONFIG, {}); raw.remote = r; writePrivate(CONFIG, raw); }
-function saveNetwork(n) { const raw = readJson(CONFIG, {}); raw.network = n; writePrivate(CONFIG, raw); }
+// never rewrite a damaged config.json from {} — that would wipe the sensors and token
+function readConfigForUpdate() { const bad = configDamaged(); if (bad) throw new Error(`settings file ${CONFIG} is damaged (${bad}) — not changing it`); return readJson(CONFIG, {}); }
+// BUG-005 (skywarden): set-plug crashed with a stack trace on a wrong-shape config, and set-reserve
+// rewrote a damaged config (a bare "string" was saved back as invalid JSON) and said "Reserve removed".
+// CLI commands that change settings refuse a damaged file, same message as status/check (BUG-001/003).
+function readConfigForCommand() {
+  const bad = configDamaged();
+  if (bad) { console.error(`Settings file ${CONFIG} is damaged (${bad}) — not changing it. Fix it, or restore ${CONFIG}.bak if it exists.`); process.exit(1); }
+  return readJson(CONFIG, null);
+}
+function saveRemote(r) { const raw = readConfigForUpdate(); raw.remote = r; writePrivate(CONFIG, raw); }
+function saveNetwork(n) { const raw = readConfigForUpdate(); raw.network = n; writePrivate(CONFIG, raw); }
+function saveHobby(h) { const raw = readConfigForUpdate(); raw.hobby = h; writePrivate(CONFIG, raw); }
+// My station: private logbook, range record and hobby alerts (station.js). Data stays on this computer.
+let _station = null;
+function station() {
+  if (!_station) _station = require('./station')({ home: HOME, loadConfig, saveHobby, log, tryHttp, devBase, sendAlert });
+  return _station;
+}
 let _network = null;
 function network() {
   if (!_network) _network = require('./network')({ loadConfig, saveNetwork, log, http });
@@ -1284,6 +1335,7 @@ function acquireLock() {
 
 async function runLoop() {
   let cfg = loadConfig();
+  if (!cfg && configDamaged()) process.exit(1); // loadConfig already logged why
   if (!cfg || !cfg.sensors.length) { console.error(`Not set up yet. Run: ${APP} setup`); process.exit(1); }
   if (!acquireLock()) { log('another Sensor Keeper is already running — exiting'); process.exit(0); }
   log(`Sensor Keeper ${VERSION} started, watching ${cfg.sensors.map((s) => s.id).join(', ')}${cfg.dryRun ? ' [dry-run]' : ''}`);
@@ -1291,6 +1343,7 @@ async function runLoop() {
   setInterval(() => { const c = loadConfig(); if (c && c.remote && c.remote.topic) remote().poll().catch(() => {}); }, 5000);
   if (cfg.remote && cfg.remote.relay) remote().relayConnect();
   network().start();
+  station().start();
   let lastCheck = 0;
   let lastUpdateTry = 0;
   const selfFile = selfTarget().file;
@@ -1372,8 +1425,8 @@ async function setup() {
   const cfg = JSON.parse(JSON.stringify(old));
   const rl = makeRl();
   console.log(`
-Sensor Keeper ${VERSION} — setup
-─────────────────────────────────
+Sensor Keeper by Sky Warden Flight Tracker, ${VERSION} — setup
+────────────────────────────────────────────────────────────
 This keeps your 4DSKY / Neuron sensor's Hedera testnet account topped up so its
 heartbeats never stop. Everything you enter is saved only on this computer, in
 ${CONFIG} (readable only by your user account).
@@ -1459,9 +1512,15 @@ Nothing here uses real money: testnet HBAR is free and has no value.
   }
   cfg.sensors = sensors;
 
-  // Token
+  // HBAR top-ups: the Sky Warden app does them, so they're optional here.
   console.log(`
-Step 2 — Hedera Portal access token (this is what pays for top-ups, for free)
+Step 2 — HBAR top-ups
+  The Sky Warden app tops up your sensor automatically (your device → HBAR top-ups),
+  so most owners leave this off. Turn it on only if you want this computer to do it too.`);
+  cfg.topups = await askYesNo(rl, '  Also top up HBAR from this computer?', topupsOn(old));
+  if (cfg.topups) {
+  console.log(`
+Hedera Portal access token (this is what pays for top-ups, for free)
   1. Go to https://portal.hedera.com and sign in (create a free account if needed).
   2. Open your account settings and create a "Personal Access Token".
   3. Paste it below. It is stored only in ${CONFIG}.
@@ -1482,13 +1541,14 @@ Step 2 — Hedera Portal access token (this is what pays for top-ups, for free)
   }
 
   // Thresholds
-  console.log('\nStep 3 — when to top up (Enter accepts the recommended values)');
+  console.log('\nWhen to top up (Enter accepts the recommended values)');
   const lw = parseFloat(await ask(rl, '  Top up when a sensor drops below (HBAR)', old.lowWater));
   cfg.lowWater = lw > 0 ? lw : DEFAULTS.lowWater;
   const ta = parseInt(await ask(rl, `  Amount per top-up (HBAR, max ${FAUCET_MAX_REQUEST})`, old.topupAmount), 10);
   cfg.topupAmount = Math.min(FAUCET_MAX_REQUEST, ta > 0 ? ta : DEFAULTS.topupAmount);
   if (cfg.sensors.length * cfg.topupAmount > FAUCET_DAILY_LIMIT) {
     console.log(`  Note: ${cfg.sensors.length} sensors × ${cfg.topupAmount} HBAR is more than the 100/day faucet limit; top-ups will be spread over several days, which is fine.`);
+  }
   }
 
   // Alerts
@@ -1751,7 +1811,7 @@ function showStatus() {
     console.log(`  ${s.name ? `${s.name} ` : ''}${s.id}: ${x.lastBalance != null ? fmt(x.lastBalance) + ' HBAR' : 'no data yet'}${days}` +
       `${x.lastTopup ? `, last top-up ${iso(x.lastTopup)}` : ''}${probs.length ? `, PROBLEMS: ${probs.join(', ')}` : ''}`);
   }
-  console.log(`Top up below ${cfg.lowWater} HBAR, ${cfg.topupAmount} HBAR at a time. Settings: ${CONFIG}`);
+  console.log(`${topupsOn(cfg) ? `Top up below ${cfg.lowWater} HBAR, ${cfg.topupAmount} HBAR at a time` : 'HBAR top-ups: off here (the Sky Warden app does them)'}. Settings: ${CONFIG}`);
 }
 
 // ---------------------------------------------------------------- app window (local web UI)
@@ -1814,6 +1874,7 @@ function publicConfig(cfg) {
   delete c.portalToken;
   c.sensors = (c.sensors || []).map(({ devicePassword, ...s }) => ({ ...s, devicePasswordSet: !!devicePassword }));
   c.tokenSet = !!t;
+  c.topups = topupsOn(cfg);
   c.tokenHint = t ? '…' + t.slice(-4) : '';
   if (c.network) c.network = { url: c.network.url, feederId: c.network.feederId, share: !!c.network.share };
   if (c.reserve) c.reserve = { account: c.reserve.account || null, floor: c.reserve.floor ?? 50, refillTo: c.reserve.refillTo || 0, keySet: !!c.reserve.key };
@@ -1892,6 +1953,28 @@ async function runUi() {
           fixes: COMMUNITY_FIXES.map((f) => ({ id: f.id, title: f.title, description: f.description })),
         });
       }
+      if (api === 'station') {
+        const list = (cfg ? cfg.sensors : []).map((x) => ({ id: x.id, name: x.name || x.id, hasAddress: !!x.statusUrl, ...station().summary(x.id) }));
+        const h = (cfg && cfg.hobby) || {};
+        return send(res, 200, { sensors: list, hobby: { station: h.station !== false, rangeRecord: h.rangeRecord !== false, watch: Array.isArray(h.watch) ? h.watch : [] } });
+      }
+      if (api === 'logbook') {
+        const id = url.searchParams.get('id') || '';
+        if (!cfg || !cfg.sensors.some((x) => x.id === id)) return send(res, 404, { error: 'unknown sensor' });
+        return send(res, 200, { items: station().search(id, (url.searchParams.get('q') || '').slice(0, 40), 200) });
+      }
+      if (api === 'hobby-save') {
+        if (!cfg) return send(res, 400, { error: 'Set up Sensor Keeper first.' });
+        const b = await body(req);
+        const raw = Array.isArray(b.watch) ? b.watch : String(b.watch || '').split(/[\s,;]+/);
+        const watch = [...new Set(raw.map((v) => String(v).trim().toUpperCase()).filter(Boolean))];
+        const badOne = watch.find((v) => !/^[A-Z0-9-]{2,10}$/.test(v));
+        if (badOne) return send(res, 400, { error: `"${badOne}" isn't a registration, flight, airline code, type or hex code.` });
+        if (watch.length > 50) return send(res, 400, { error: 'Up to 50 watch-list entries.' });
+        saveHobby({ ...(cfg.hobby || {}), station: b.station !== false, rangeRecord: b.rangeRecord !== false, watch });
+        log(`station: hobby alerts saved (${watch.length} on the watch list, range records ${b.rangeRecord !== false ? 'on' : 'off'})`);
+        return send(res, 200, { ok: true, watch });
+      }
       if (api === 'activity') return send(res, 200, { items: readActivity(parseInt(url.searchParams.get('n') || '300', 10)) });
       if (api === 'check-sensor') {
         const b = await body(req);
@@ -1930,7 +2013,8 @@ async function runUi() {
           next.portalToken = tok;
           const st = loadState(); st.tokenBadUntil = 0; saveState(st);
         }
-        if (!next.portalToken) return send(res, 400, { error: 'Paste your Hedera Portal access token (see step 2).' });
+        next.topups = b.topups === true;
+        if (next.topups && !next.portalToken) return send(res, 400, { error: 'To top up from this computer, paste your Hedera Portal access token (step 2), or turn top-ups off.' });
         const lw = parseFloat(b.lowWater), ta = parseInt(b.topupAmount, 10), ce = parseInt(b.checkEveryMinutes, 10);
         next.lowWater = lw > 0 ? lw : DEFAULTS.lowWater;
         next.topupAmount = Math.min(FAUCET_MAX_REQUEST, ta > 0 ? ta : DEFAULTS.topupAmount);
@@ -2032,13 +2116,13 @@ function installLaunchers() {
 
 const UI_HTML = String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sensor Keeper</title>
+<title>Sensor Keeper by Sky Warden Flight Tracker</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--ink:#1d2430;--muted:#5f6b7a;--line:#e1e6ed;--accent:#0f7b8a;--accent-ink:#fff;--ok:#1a7f4b;--warn:#b26a00;--bad:#c0392b;--chip:#eef2f6;--topup:#e6f5ee}
 @media (prefers-color-scheme:dark){:root{--bg:#0f141a;--card:#171e26;--ink:#e6ebf1;--muted:#98a4b3;--line:#27313c;--accent:#27a9b8;--accent-ink:#06181b;--ok:#3ccf85;--warn:#f0a53a;--bad:#ff6b5e;--chip:#202a35;--topup:#12291f}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 header{display:flex;align-items:center;gap:12px;padding:18px 24px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
-header h1{font-size:19px;margin:0}header .ver{color:var(--muted);font-size:13px}.grow{flex:1}
+header h1{font-size:19px;margin:0}header h1 .by{font-size:13px;font-weight:400;color:var(--muted)}@media (max-width:560px){header h1 .by{display:none}}header .ver{color:var(--muted);font-size:13px}.grow{flex:1}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:13px;background:var(--chip)}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}.dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}.dot.warn{background:var(--warn)}
 main{max-width:980px;margin:0 auto;padding:20px 16px 80px;display:grid;gap:16px}
@@ -2069,11 +2153,12 @@ button.small{padding:5px 10px;font-size:13px}button:disabled{opacity:.55;cursor:
 a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--muted);font-size:14px}
 .warnbox{border-left:3px solid var(--warn);padding:6px 10px;background:var(--chip);border-radius:6px;font-size:13px;margin-top:8px}
 .hidden{display:none}.seg{display:flex;gap:6px}.seg button.on{border-color:var(--accent);font-weight:600}
+.strow{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start}@media (max-width:720px){.strow{grid-template-columns:1fr}}table.lb{width:100%;border-collapse:collapse;margin-top:10px;font-size:14px}table.lb td,table.lb th{text-align:left;padding:6px;border-bottom:1px solid var(--line)}table.lb th{color:var(--muted);font-weight:500;font-size:12px}#hbWatch{width:100%;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);box-sizing:border-box}#stPolar svg{width:100%;max-width:260px;height:auto}
 </style></head><body>
-<header><h1>Sensor Keeper</h1><span class="ver">v__VERSION__</span><span class="grow"></span>
+<header><h1>Sensor Keeper <span class="by">by Sky Warden Flight Tracker</span></h1><span class="ver">v__VERSION__</span><span class="grow"></span>
 <span class="pill"><span id="svcDot" class="dot"></span><span id="svcText">…</span></span></header>
 <main>
-<nav class="tabs"><button data-tab="status" class="on">Status &amp; activity</button><button data-tab="settings">Settings</button></nav>
+<nav class="tabs"><button data-tab="status" class="on">Status &amp; activity</button><button data-tab="station">My station</button><button data-tab="settings">Settings</button></nav>
 
 <section id="tab-status">
   <div class="card"><h2>Your sensors</h2><p class="help" id="lastRun">Loading…</p><div id="sensorStatus"></div>
@@ -2085,29 +2170,57 @@ a{color:var(--accent)}ol.steps{margin:6px 0 0;padding-left:20px;color:var(--mute
       <div class="stat"><div class="k">Last top-up</div><div class="v" id="stLast" style="font-size:15px">never</div></div>
       <div class="stat"><div class="k">Faucet used (24 h)</div><div class="v" id="stFaucet">0 / 100</div></div>
     </div>
-    <div class="actions" style="justify-content:space-between"><div class="seg"><button class="btn small on" data-f="important">Top-ups, alerts &amp; problems</button><button class="btn small" data-f="all">Everything</button></div>
+    <div class="actions" style="justify-content:space-between"><div class="seg"><button class="btn small on" data-f="important">Alerts &amp; problems</button><button class="btn small" data-f="all">Everything</button></div>
       <span class="note">Updates automatically</span></div>
     <ul class="feed" id="feed" style="margin-top:8px"></ul>
   </div>
 </section>
 
+<section id="tab-station" class="hidden">
+  <div class="card"><h2>My station</h2><p class="help">A private logbook of every aircraft your sensor has heard, and how far it reaches. Kept only on this computer; sampled once a minute while Sensor Keeper runs in the background.</p>
+    <div class="actions" id="stPickWrap" style="margin:8px 0"><span>Sensor</span><select id="stPick"></select></div>
+    <div class="stats" style="margin:10px 0 14px">
+      <div class="stat"><div class="k">Aircraft today</div><div class="v" id="stToday">-</div></div>
+      <div class="stat"><div class="k">This week</div><div class="v" id="stWeek">-</div></div>
+      <div class="stat"><div class="k">All time</div><div class="v" id="stAll">-</div></div>
+      <div class="stat"><div class="k">New today</div><div class="v" id="stNew">-</div></div>
+    </div>
+    <div class="strow"><div id="stPolar"></div>
+      <div><p><b>Farthest catch:</b> <span id="stRec">-</span></p><p><b>Farthest today:</b> <span id="stRecToday">-</span></p><p><b>Military aircraft logged:</b> <span id="stMil">-</span></p><p><b>Most common types:</b> <span id="stTypes" class="note">-</span></p><p class="note" id="stSince"></p></div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px"><h2>Logbook</h2>
+    <div class="actions"><input type="text" id="lbQ" placeholder="Search registration, flight, type, operator or hex" spellcheck="false" style="flex:1"><button class="btn small" id="lbGo">Search</button></div>
+    <table class="lb" id="lbTable"></table>
+  </div>
+  <div class="card" style="margin-top:16px"><h2>Hobby alerts</h2><p class="help">Sent to the same Discord / ntfy you set up in Settings.</p>
+    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="hbRec" style="width:auto"> Tell me when my sensor sets a new range record</label>
+    <label for="hbWatch" style="margin-top:12px">Watch list: alert when one of these comes into range. Registrations, flights, 3-letter airline codes, aircraft types, hex codes, or the word MILITARY.</label>
+    <textarea id="hbWatch" rows="3" spellcheck="false" placeholder="N123AB, UAL, C17, MILITARY"></textarea>
+    <div class="actions" style="margin-top:8px"><button class="btn primary small" id="hbSave">Save hobby alerts</button><span class="note" id="hbNote"></span></div>
+  </div>
+</section>
 <section id="tab-settings" class="hidden">
   <div class="card"><h2>1. Your sensor(s)</h2>
     <p class="help">Enter each sensor's own Hedera <b>device account ID</b> (looks like 0.0.1234567) — the account that pays for its heartbeats, not your wallet or rewards account. It's in the 4DSKY app and your sensor's Neuron setup.</p>
     <p class="help"><b>Air!Squitter IP address:</b> enter <i>your</i> sensor's address on <i>this computer's</i> network (every network is different — find it in your router's list of connected devices, often named "air-squitter", or try air-squitter.local). Sensor Keeper uses it to check the sensor's health, explain problems, and install updates and fixes. <b>The address must be fixed</b>: set a "DHCP reservation" / "fixed IP" for the air-squitter in your router (or a static IP on the sensor if you know your network's settings). If it changes, Sensor Keeper loses track of the sensor until you update it here. Leave it blank for sensors at other locations or that aren't Air!Squitters — top-ups and heartbeat alerts still work for them; for health checks and fixes at another location, install Sensor Keeper on a computer there too.</p>
     <div id="sensorList"></div><button class="btn" id="addSensor">+ Add another sensor</button></div>
 
-  <div class="card"><h2>2. Hedera Portal access token</h2>
-    <p class="help">Top-ups come from Hedera's free, official faucet, which needs your own token. It's stored only on this computer.</p>
+  <div class="card"><h2>2. HBAR top-ups</h2>
+    <p class="help">The <b>Sky Warden app</b> tops up your sensor automatically (open your device → HBAR top-ups). <a href="https://testflight.apple.com/join/YACdmyaA" target="_blank" rel="noopener">Get the iPhone app (beta)</a>. Most owners use that and leave this off. Sensor Keeper still watches the balance and warns you if it gets low.</p>
+    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="topupsOn" style="width:auto"> Also top up HBAR from this computer</label>
+    <div id="topupBox">
+    <p class="help" style="margin-top:12px">Top-ups from here use Hedera's free, official faucet, which needs your own token. It's stored only on this computer.</p>
     <ol class="steps"><li>Go to <a href="https://portal.hedera.com" target="_blank" rel="noopener">portal.hedera.com</a> and sign in. If you don't have an account, create one for free.</li><li>Open your account settings and create a new <b>Personal Access Token</b>.</li><li>Copy the token. It is a long code that starts with <code>v4.public.</code></li><li>Paste it in the box below and press Save settings.</li></ol>
     <label for="token">Access token</label><input type="password" id="token" autocomplete="off" spellcheck="false">
-    <div class="note" id="tokenNote"></div></div>
-
-  <div class="card"><h2>3. When to top up</h2>
-    <p class="help">Hedera allows 100 test HBAR per person per day and one top-up per sensor per day. A sensor uses about 7 HBAR a day.</p>
+    <div class="note" id="tokenNote"></div>
+    <p class="help" style="margin-top:12px">Hedera allows 100 test HBAR per person per day and one top-up per sensor per day. A sensor uses about 7 HBAR a day.</p>
     <div class="row3"><div><label for="lowWater">Top up when below (HBAR)</label><input type="number" id="lowWater" min="1"></div>
-      <div><label for="topupAmount">Amount per top-up (max 100)</label><input type="number" id="topupAmount" min="1" max="100"></div>
-      <div><label for="checkEvery">Check every (minutes)</label><input type="number" id="checkEvery" min="10" max="720"></div></div></div>
+      <div><label for="topupAmount">Amount per top-up (max 100)</label><input type="number" id="topupAmount" min="1" max="100"></div></div>
+    </div></div>
+
+  <div class="card"><h2>3. How often to check</h2>
+    <div class="row3"><div><label for="checkEvery">Check every (minutes)</label><input type="number" id="checkEvery" min="10" max="720"></div></div></div>
 
   <div class="card"><h2>4. Alerts</h2>
     <p class="help">You'll only hear from Sensor Keeper when something needs attention, plus a short "resolved" note and an optional weekly summary.</p>
@@ -2143,8 +2256,8 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function toast(m,ms){var t=$('toast');t.textContent=m;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(function(){t.style.display='none';},ms||4500);}
 function ago(ts){if(!ts)return 'never';var s=(Date.now()-new Date(ts).getTime())/1000;if(s<90)return 'just now';if(s<5400)return Math.round(s/60)+' min ago';if(s<172800)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' days ago';}
 function local(ts){try{return new Date(ts).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){return ts;}}
-var PROB={heartbeat:'not sending heartbeats',low:'almost out of HBAR',topup:'top-up failing',missing:'account not found (testnet reset?)',mirror:"can't reach Hedera",'device-status':'sensor reports a problem','device-down':'status page unreachable'};
-document.querySelectorAll('nav.tabs button').forEach(function(b){b.onclick=function(){document.querySelectorAll('nav.tabs button').forEach(function(x){x.classList.toggle('on',x===b);});$('tab-status').classList.toggle('hidden',b.dataset.tab!=='status');$('tab-settings').classList.toggle('hidden',b.dataset.tab!=='settings');$('savebar').classList.toggle('hidden',b.dataset.tab!=='settings');};});
+var PROB={heartbeat:'not sending heartbeats',low:'almost out of HBAR',lowSoon:'running low on HBAR',topup:'top-up failing',missing:'account not found (testnet reset?)',mirror:"can't reach Hedera",'device-status':'sensor reports a problem','device-down':'status page unreachable'};
+document.querySelectorAll('nav.tabs button').forEach(function(b){b.onclick=function(){document.querySelectorAll('nav.tabs button').forEach(function(x){x.classList.toggle('on',x===b);});$('tab-status').classList.toggle('hidden',b.dataset.tab!=='status');$('tab-settings').classList.toggle('hidden',b.dataset.tab!=='settings');$('tab-station').classList.toggle('hidden',b.dataset.tab!=='station');if(b.dataset.tab==='station')loadStation();$('savebar').classList.toggle('hidden',b.dataset.tab!=='settings');};});
 function showTab(t){document.querySelector('nav.tabs button[data-tab="'+t+'"]').click();}
 function renderService(){var v=S.service,d=$('svcDot'),t=$('svcText');
   if(v.running){d.className='dot ok';t.textContent='Running in background'+(v.mode==='always'?' (even when logged out)':'');}
@@ -2158,12 +2271,12 @@ function renderService(){var v=S.service,d=$('svcDot'),t=$('svcText');
 function renderStatus(){
   $('lastRun').textContent=S.lastRun?('Last checked '+ago(S.lastRun)+'. Checks run every '+S.config.checkEveryMinutes+' minutes.'):'No checks yet.';
   var h='';S.sensors.forEach(function(s){var days=(s.balance!=null&&s.burnPerDay)?Math.round(s.balance/s.burnPerDay):null;
-    var ok=!s.problems.length;h+='<div class="sensor"><div class="actions" style="justify-content:space-between"><div><b>'+esc(s.name||s.id)+'</b> <span class="note">'+esc(s.id)+'</span>'+(s.listed===true?' <span class="note">· listed for buyers ✓</span>':s.listed===false?' <span class="note" style="color:var(--bad,#c33)">· NOT listed for buyers</span>':'')+'</div><div class="actions"><span class="pill"><span class="dot '+(ok?'ok':'bad')+'"></span>'+(ok?'Healthy':esc(s.problems.map(function(p){return PROB[p]||p;}).join(', ')))+'</span><button class="btn small" data-topup="'+esc(s.id)+'">Top up now</button></div></div>'+
-    '<div class="stats" style="margin-top:10px"><div class="stat"><div class="k">Balance</div><div class="v">'+(s.balance!=null?s.balance.toFixed(1):'–')+' <span style="font-size:13px">HBAR</span></div></div><div class="stat"><div class="k">Days left</div><div class="v">'+(days!=null?days:'–')+'</div></div><div class="stat"><div class="k">Uses per day</div><div class="v">'+(s.burnPerDay?s.burnPerDay.toFixed(1):'–')+'</div></div><div class="stat"><div class="k">Last top-up</div><div class="v" style="font-size:15px">'+(s.lastTopup?ago(s.lastTopup):'never')+'</div></div></div></div>';});
+    var ok=!s.problems.length;h+='<div class="sensor"><div class="actions" style="justify-content:space-between"><div><b>'+esc(s.name||s.id)+'</b> <span class="note">'+esc(s.id)+'</span>'+(s.listed===true?' <span class="note">· listed for buyers ✓</span>':s.listed===false?' <span class="note" style="color:var(--bad,#c33)">· NOT listed for buyers</span>':'')+'</div><div class="actions"><span class="pill"><span class="dot '+(ok?'ok':'bad')+'"></span>'+(ok?'Healthy':esc(s.problems.map(function(p){return PROB[p]||p;}).join(', ')))+'</span>'+(S.config.topups?'<button class="btn small" data-topup="'+esc(s.id)+'">Top up now</button>':'')+'</div></div>'+
+    '<div class="stats" style="margin-top:10px"><div class="stat"><div class="k">Balance</div><div class="v">'+(s.balance!=null?s.balance.toFixed(1):'–')+' <span style="font-size:13px">HBAR</span></div></div><div class="stat"><div class="k">Days left</div><div class="v">'+(days!=null?days:'–')+'</div></div><div class="stat"><div class="k">Uses per day</div><div class="v">'+(s.burnPerDay?s.burnPerDay.toFixed(1):'–')+'</div></div><div class="stat"><div class="k">'+(S.config.topups?'Last top-up':'Top-ups')+'</div><div class="v" style="font-size:15px">'+(S.config.topups?(s.lastTopup?ago(s.lastTopup):'never'):'by the Sky Warden app')+'</div></div></div></div>';});
   $('sensorStatus').innerHTML=h||'<p class="help">No sensors yet — open <a href="#" id="goSet">Settings</a> to add yours.</p>';
   if($('goSet'))$('goSet').onclick=function(e){e.preventDefault();showTab('settings');};
   document.querySelectorAll('[data-topup]').forEach(function(b){b.onclick=function(){if(!confirm('Request a top-up for '+b.dataset.topup+' now? It uses part of your daily 100 HBAR faucet allowance.'))return;b.disabled=true;api('topup',{id:b.dataset.topup}).then(function(r){toast(r.result,8000);refresh();}).catch(function(e){toast(e.message,8000);}).then(function(){b.disabled=false;});};});
-  var t=S.topups;$('stCount').textContent=t.count;$('stTotal').textContent=t.total.toLocaleString();$('stLast').textContent=t.last?local(t.last):'never';$('stFaucet').textContent=S.faucetUsed+' / '+S.faucetLimit;}
+  var t=S.topups;var ts=$('stCount').closest('.stats');if(ts)ts.classList.toggle('hidden',!S.config.topups&&!t.count);$('stCount').textContent=t.count;$('stTotal').textContent=t.total.toLocaleString();$('stLast').textContent=t.last?local(t.last):'never';$('stFaucet').textContent=S.faucetUsed+' / '+S.faucetLimit;}
 function sensorRow(s){var d=document.createElement('div');d.className='sensor';
   d.innerHTML='<div class="row"><div><label>Account ID</label><input type="text" class="sid" placeholder="0.0.1234567" value="'+esc(s.id)+'"></div><div><label>Nickname (optional)</label><input type="text" class="sname" value="'+esc(s.name)+'"></div><div><label>Air!Squitter IP address — must be fixed (optional)</label><input type="text" class="surl" placeholder="your sensor\'s IP, e.g. 192.168.1.50" value="'+esc(s.statusUrl)+'"></div><div><label>Air!Squitter admin password</label><input type="password" class="spw" autocomplete="new-password" placeholder="'+(s.devicePasswordSet?'your saved password — type to change':'factory default — type to change')+'">'+(s.devicePasswordSet?'<label class="note" style="display:flex;gap:6px;align-items:center;margin-top:4px"><input type="checkbox" class="spwreset"> use factory default</label>':'')+'</div><div class="actions"><button class="btn small chk">Check</button><button class="btn small rm" title="Remove">Remove</button></div></div><div class="note res"></div>';
   d.querySelector('.rm').onclick=function(){d.remove();markDirty();};
@@ -2172,15 +2285,17 @@ function sensorRow(s){var d=document.createElement('div');d.className='sensor';
   d.querySelectorAll('input').forEach(function(i){i.oninput=markDirty;});return d;}
 function renderSettings(){var c=S.config;var L=$('sensorList');L.innerHTML='';(S.sensors.length?S.sensors:[{id:'',name:'',statusUrl:''}]).forEach(function(s){L.appendChild(sensorRow(s));});
   $('token').value='';$('token').placeholder=c.tokenSet?'Saved ('+c.tokenHint+') — paste a new one only to replace it':'Paste your Personal Access Token';
-  $('tokenNote').className='note '+(c.tokenSet?'ok':'warn');$('tokenNote').textContent=c.tokenSet?'A token is saved.':'No token saved yet — top-ups can\'t run without it.';
+  $('tokenNote').className='note '+(c.tokenSet?'ok':'warn');$('tokenNote').textContent=c.tokenSet?'A token is saved.':'No token saved yet — top-ups from this computer can\'t run without it.';
+  $('topupsOn').checked=!!c.topups;$('topupBox').classList.toggle('hidden',!c.topups);
   $('lowWater').value=c.lowWater;$('topupAmount').value=c.topupAmount;$('checkEvery').value=c.checkEveryMinutes;
   $('discord').value=c.alerts.discordWebhook||'';$('ntfy').value=c.alerts.ntfyTopic||'';$('weekly').checked=c.weeklySummary!==false;$('autoupd').checked=c.autoUpdate===true;$('devupd').checked=c.deviceAutoUpdate===true;$('cfix').checked=c.communityFixes===true;$('fixList').innerHTML=(S.fixes||[]).map(function(f){return '<details style="margin:6px 0"><summary><b>'+esc(f.title)+'</b></summary><div style="margin-top:4px">'+esc(f.description)+'</div></details>';}).join('');dirty=false;$('saveNote').textContent='';}
 function markDirty(){dirty=true;$('saveNote').textContent='Unsaved changes';}
-['token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd','cfix'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
+$('topupsOn').addEventListener('change',function(){$('topupBox').classList.toggle('hidden',!this.checked);});
+['topupsOn','token','lowWater','topupAmount','checkEvery','discord','ntfy','weekly','autoupd','devupd','cfix'].forEach(function(id){$(id).addEventListener('input',markDirty);$(id).addEventListener('change',markDirty);});
 $('addSensor').onclick=function(){$('sensorList').appendChild(sensorRow({id:'',name:'',statusUrl:''}));markDirty();};
 $('genTopic').onclick=function(){var a='abcdefghjkmnpqrstuvwxyz23456789',r='sk-';for(var i=0;i<10;i++)r+=a[Math.floor(Math.random()*a.length)];$('ntfy').value=r;markDirty();};
 $('save').onclick=function(){var b=$('save');b.disabled=true;var sensors=[];document.querySelectorAll('#sensorList .sensor').forEach(function(d){sensors.push({id:d.querySelector('.sid').value.trim(),name:d.querySelector('.sname').value.trim(),statusUrl:d.querySelector('.surl').value.trim(),devicePassword:d.querySelector('.spw').value,clearPassword:!!(d.querySelector('.spwreset')&&d.querySelector('.spwreset').checked)});});
-  api('save',{sensors:sensors,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked,communityFixes:$('cfix').checked})
+  api('save',{sensors:sensors,topups:$('topupsOn').checked,portalToken:$('token').value.trim(),lowWater:$('lowWater').value,topupAmount:$('topupAmount').value,checkEveryMinutes:$('checkEvery').value,discordWebhook:$('discord').value.trim(),ntfyTopic:$('ntfy').value.trim(),weeklySummary:$('weekly').checked,autoUpdate:$('autoupd').checked,deviceAutoUpdate:$('devupd').checked,communityFixes:$('cfix').checked})
   .then(function(){toast(S.service.running?'Saved. The background service picks up the changes within a minute.':'Saved. Now start the background service (step 5).');return refresh(true);}).catch(function(e){toast(e.message,9000);$('saveNote').textContent=e.message;}).then(function(){b.disabled=false;});};
 function svc(action){var btns=[$('svcStart'),$('svcStop')];btns.forEach(function(x){x.disabled=true;});$('svcNote').textContent=action==='install'?'Starting…'+(S.platform==='darwin'&&$('always').checked?' (enter your Mac password in the dialog)':''):'Stopping…';
   api('service',{action:action,always:$('always').checked}).then(function(){toast(action==='install'?'Background service started.':'Background service stopped.');return refresh();}).catch(function(e){toast(e.message,9000);$('svcNote').textContent=e.message;}).then(function(){btns.forEach(function(x){x.disabled=false;});});}
@@ -2201,6 +2316,30 @@ function friendly(e){var m=e.msg;var r=m.match(/^(.*?): top-up of ([\d.]+) HBAR 
 function loadFeed(){return api('activity?n=400').then(function(j){var items=j.items.filter(function(e){return filter==='all'||e.kind==='topup'||e.kind==='problem'||e.kind==='alert';}).slice(0,200);
   $('feed').innerHTML=items.length?items.map(function(e){return '<li class="'+e.kind+'"><span class="t">'+esc(local(e.t))+'</span><span>'+friendly(e)+'</span></li>';}).join(''):'<li><span></span><span class="note">'+(filter==='all'?'No activity yet.':'No top-ups or problems yet — that\'s good news. Choose "Everything" to see every check.')+'</span></li>';});}
 function refresh(resetSettings){return api('state').then(function(j){var first=!S;S=j;renderService();renderStatus();if(first||resetSettings||!dirty)renderSettings();if(first&&!j.configured)showTab('settings');return loadFeed();}).catch(function(e){toast('Lost connection to Sensor Keeper: '+e.message+'. Reopen the app.',10000);});}
+var ST=null,stSel='';
+function km(x){return x==null?'-':Math.round(x)+' km';}
+function catchText(c){if(!c)return 'none yet';var w=c.fli||c.reg||c.hex;return esc(w)+(c.typ?' ('+esc(c.typ)+')':'')+', '+km(c.km)+(c.alt!=null?' at '+esc(c.alt)+' ft':'')+' &middot; '+esc(local(c.t));}
+function polar(bins,hasB){var m=Math.max.apply(null,bins.concat([10])),R=110,c=120,o='<svg viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">';
+  var step=m>300?100:m>120?50:m>50?25:10;for(var r=step;r<=m;r+=step){o+='<circle cx="120" cy="120" r="'+(r/m*R).toFixed(1)+'" fill="none" stroke="var(--line)"/><text x="'+(c+3)+'" y="'+(c-r/m*R+11).toFixed(1)+'" font-size="9" fill="var(--muted)">'+r+'</text>';}
+  o+='<line x1="120" y1="8" x2="120" y2="232" stroke="var(--line)"/><line x1="8" y1="120" x2="232" y2="120" stroke="var(--line)"/><text x="116" y="8" font-size="9" fill="var(--muted)">N</text>';
+  if(hasB&&m>10){var pts=[];for(var i=0;i<36;i++){var a=(i*10+5-90)*Math.PI/180,d=bins[i]/m*R;pts.push((c+Math.cos(a)*d).toFixed(1)+','+(c+Math.sin(a)*d).toFixed(1));}o+='<polygon points="'+pts.join(' ')+'" fill="var(--accent)" fill-opacity=".25" stroke="var(--accent)" stroke-width="1.5"/>';}
+  else o+='<text x="120" y="124" font-size="11" text-anchor="middle" fill="var(--muted)">coverage appears as aircraft are heard</text>';
+  return o+'</svg>';}
+function renderStation(){var s=null;(ST.sensors||[]).forEach(function(x){if(x.id===stSel)s=x;});if(!s)return;
+  $('stToday').textContent=s.today;$('stWeek').textContent=s.week;$('stAll').textContent=s.total;$('stNew').textContent=s.newToday;$('stMil').textContent=s.military;
+  $('stRec').innerHTML=catchText(s.range.rec);$('stRecToday').innerHTML=catchText(s.range.todayRec);$('stPolar').innerHTML=polar(s.range.bins,s.range.hasBearing);
+  $('stTypes').textContent=(s.types||[]).map(function(t){return t.t+' ('+t.n+')';}).join(', ')||'-';
+  $('stSince').textContent=!s.hasAddress?'Add this sensor\'s AirSquitter address in Settings to start the logbook.':(s.total?'Logging since '+local(s.since)+'. Updates every couple of minutes.':'Nothing logged yet. Make sure Sensor Keeper is running in the background.');
+  loadLogbook();}
+function loadStation(){api('station').then(function(j){ST=j;var p=$('stPick');if(!stSel&&j.sensors.length)stSel=j.sensors[0].id;
+  p.innerHTML=j.sensors.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===stSel?' selected':'')+'>'+esc(x.name)+'</option>';}).join('');$('stPickWrap').classList.toggle('hidden',j.sensors.length<2);
+  if(!hbDirty){$('hbRec').checked=j.hobby.rangeRecord;$('hbWatch').value=(j.hobby.watch||[]).join(', ');}renderStation();}).catch(function(e){toast(e.message);});}
+function loadLogbook(){if(!stSel)return;api('logbook?id='+encodeURIComponent(stSel)+'&q='+encodeURIComponent($('lbQ').value.trim())).then(function(j){
+  $('lbTable').innerHTML='<tr><th>Aircraft</th><th>Type</th><th>Operator</th><th>Days seen</th><th>First seen</th><th>Last seen</th></tr>'+(j.items.length?j.items.slice(0,100).map(function(a){return '<tr><td><b>'+esc(a.reg||a.hex)+'</b>'+(a.fli?' <span class="note">'+esc(a.fli)+'</span>':'')+(a.mil?' <span class="tag alert">military</span>':'')+'</td><td>'+esc(a.typ)+'</td><td>'+esc(a.opr)+'</td><td>'+a.days+'</td><td>'+esc(local(a.first))+'</td><td>'+esc(ago(a.last))+'</td></tr>';}).join(''):'<tr><td colspan="6" class="note">No matches.</td></tr>');}).catch(function(){});}
+var hbDirty=false;['hbRec','hbWatch'].forEach(function(id){$(id).addEventListener('input',function(){hbDirty=true;});$(id).addEventListener('change',function(){hbDirty=true;});});
+$('stPick').onchange=function(){stSel=this.value;renderStation();};$('lbGo').onclick=loadLogbook;$('lbQ').addEventListener('keydown',function(e){if(e.key==='Enter')loadLogbook();});
+$('hbSave').onclick=function(){api('hobby-save',{rangeRecord:$('hbRec').checked,watch:$('hbWatch').value}).then(function(r){hbDirty=false;$('hbWatch').value=r.watch.join(', ');$('hbNote').textContent='Saved.';toast('Hobby alerts saved.');}).catch(function(e){$('hbNote').textContent=e.message;});};
+setInterval(function(){if(!document.hidden&&!$('tab-station').classList.contains('hidden'))loadStation();},60000);
 refresh();setInterval(function(){if(!document.hidden)refresh();},20000);setInterval(function(){api('ping').catch(function(){});},15000);
 window.addEventListener('beforeunload',function(e){if(dirty){e.preventDefault();e.returnValue='';}});
 </script></body></html>`;
@@ -2208,7 +2347,7 @@ window.addEventListener('beforeunload',function(e){if(dirty){e.preventDefault();
 
 // ---------------------------------------------------------------- main
 function help() {
-  console.log(`Sensor Keeper ${VERSION} — keeps 4DSKY / Neuron sensors funded with Hedera testnet HBAR
+  console.log(`Sensor Keeper by Sky Warden Flight Tracker, ${VERSION} — keeps 4DSKY / Neuron sensors online and funded with Hedera testnet HBAR
 
 Usage: ${APP} <command>
 
@@ -2248,11 +2387,13 @@ Settings live in ${HOME}`);
 }
 
 async function main() {
-  const argv = process.argv.slice(2).filter((a) => a !== '--dry-run');
+  // (-psn_… is added by macOS when an app is opened from Finder; it isn't a command)
+  const argv = process.argv.slice(2).filter((a) => a !== '--dry-run' && !a.startsWith('-psn_'));
   const desktop = process.platform === 'win32' || process.platform === 'darwin' || !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
   const cmd = argv[0] || (desktop ? 'ui' : (process.stdin.isTTY && !loadConfig() ? 'setup' : 'help'));
   const needCfg = () => {
     const c = loadConfig();
+    if (!c && configDamaged()) process.exit(1); // loadConfig already logged why
     if (!c || !c.sensors.length) { console.error(`Not set up yet. Run: ${APP} setup`); process.exit(1); }
     return c;
   };
@@ -2414,7 +2555,7 @@ async function main() {
     case 'network-status': { console.log(JSON.stringify(network().status(), null, 2)); return; }
     case 'remote-status': { console.log(JSON.stringify(remote().status(), null, 2)); return; }
     case 'set-plug': {
-      const raw = readJson(CONFIG, null);
+      const raw = readConfigForCommand();
       const s2 = raw && (raw.sensors || []).find((x) => x.id === argv[1]);
       if (!s2) { console.error(`Usage: ${APP} set-plug <sensor id> shelly|kasa <ip>   (or: set-plug <sensor id> off)`); process.exit(1); }
       if (argv[2] === 'off') delete s2.plug;
@@ -2427,17 +2568,19 @@ async function main() {
       return;
     }
     case 'set-reserve': {
-      const raw = readJson(CONFIG, null);
+      const raw = readConfigForCommand();
       if (!raw) { console.error(`Run ${APP} setup first.`); process.exit(1); }
       if (argv[1] === 'off') { delete raw.reserve; writePrivate(CONFIG, raw); console.log('Reserve removed.'); return; }
-      if (!/^0\.0\.\d+$/.test(argv[1] || '')) { console.error(`Usage: ${APP} set-reserve <0.0.N account> [refill-to HBAR]   (or: set-reserve off)`); process.exit(1); }
+      if (!/^0\.0\.\d+$/.test(argv[1] || '') || (argv[2] !== undefined && !/^\d+$/.test(argv[2]))) { console.error(`Usage: ${APP} set-reserve <0.0.N account> [refill-to HBAR, whole number]   (or: set-reserve off)`); process.exit(1); }
       let key = (process.env.SENSOR_KEEPER_RESERVE_KEY || '').trim();
       if (!key) {
+        // BUG-004 (skywarden): with no keyboard (piped/closed input) the prompt never answered and the
+        // process quietly exited 0. Resolve with '' when input closes so we report "No key given."
         const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
-        key = (await new Promise((res) => rl.question('Private key of that account (not shown anywhere afterwards): ', res))).trim();
+        key = (await new Promise((res) => { rl.on('close', () => res('')); rl.question('Private key of that account (not shown anywhere afterwards): ', res); })).trim();
         rl.close();
       }
-      if (!key) { console.error('No key given.'); process.exit(1); }
+      if (!key) { console.error('\nNo key given. Run this in a terminal, or set SENSOR_KEEPER_RESERVE_KEY.'); process.exit(1); }
       raw.reserve = { account: argv[1], key, floor: 50, refillTo: Math.max(0, parseInt(argv[2] || '0', 10) || 0) };
       writePrivate(CONFIG, raw);
       const b = await getBalance(argv[1]).catch(() => null);
@@ -2452,7 +2595,11 @@ async function main() {
       return;
     }
     case 'remote-unpair': { console.log((await remote().unpair()) ? 'Unpaired: the command topic was deleted.' : 'No phone was paired.'); return; }
-    default: help();
+    case 'help': case '--help': case '-h': help(); return;
+    default:
+      // BUG-002 (skywarden): a typo used to print the help and exit 0, so scripts/installers never noticed
+      console.error(`Unknown command: ${cmd}\nRun "${APP} help" to see the commands.`);
+      process.exit(1);
   }
 }
 
