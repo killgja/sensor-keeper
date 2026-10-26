@@ -11,7 +11,10 @@ mkdir -p /etc/dnssec-trust-anchors.d
 if grep -qs 38696 /etc/dnssec-trust-anchors.d/root.positive; then
   say "KSK-2024 trust anchor already present"
 else
-  echo ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16" > /etc/dnssec-trust-anchors.d/root.positive
+  # 1.0.1: keep a backup and add KSK-2024 next to whatever is there (KSK-2017), instead of replacing the file.
+  [ -f /etc/dnssec-trust-anchors.d/root.positive ] && [ ! -f /etc/dnssec-trust-anchors.d/root.positive.jv-backup ] && \
+    cp -a /etc/dnssec-trust-anchors.d/root.positive /etc/dnssec-trust-anchors.d/root.positive.jv-backup
+  echo ". IN DS 38696 8 2 683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16" >> /etc/dnssec-trust-anchors.d/root.positive
   say "added KSK-2024 trust anchor"
 fi
 
@@ -22,7 +25,9 @@ else
   say "sources.list already OK"
 fi
 
-# 4. systemd-resolved settings (same values as Jetvision's patch)
+# 4. systemd-resolved settings (same values as Jetvision's patch). Debian 10's resolved doesn't check DNSSEC at
+#    all by default; allow-downgrade turns checking on wherever the home router passes DNSSEC data through.
+#    DNSSEC=yes would be stricter but cuts DNS off completely behind routers that strip it (sensor offline).
 if [ -f /etc/systemd/resolved.conf ]; then
   CONF=/etc/systemd/resolved.conf
   for opt in "FallbackDNS=1.1.1.1 1.0.0.1 8.8.8.8" "DNSSEC=allow-downgrade" "DNSOverTLS=opportunistic"; do

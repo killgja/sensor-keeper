@@ -70,8 +70,9 @@ say "changed:${changed:- nothing (no known resolver trust-anchor files found)}"
 { echo "# getent after"; getent hosts mlat.jetvision.de || echo "lookup FAILED"; getent hosts stun.voipgate.com || echo "stun lookup FAILED"; } >&3 2>&1
 # also show the result in the install output
 echo "jv-ksk2024-fix: $(getent hosts mlat.jetvision.de >/dev/null && echo 'mlat.jetvision.de OK' || echo 'mlat.jetvision.de FAILED'), $(getent hosts stun.voipgate.com >/dev/null && echo 'stun.voipgate.com OK' || echo 'stun.voipgate.com FAILED')"
-# make the report readable from the sensor's web server
+# The full report stays in /var/log only (it lists processes and network details). Older versions also put
+# a copy on the sensor's web server: remove it.
 for w in $(dirname $(find / -xdev -name systemstatus.html -path '*www*' 2>/dev/null | head -3) 2>/dev/null) /var/www/html /var/www; do
-  [ -d "$w" ] && cp "$LOG" "$w/jv-ksk2024-fix.txt" 2>/dev/null && chmod 644 "$w/jv-ksk2024-fix.txt" && { echo "$w/jv-ksk2024-fix.txt" >> "$B/.created"; break; }
+  [ -f "$w/jv-ksk2024-fix.txt" ] && rm -f "$w/jv-ksk2024-fix.txt"
 done
 exit 0

@@ -1,12 +1,13 @@
 #!/bin/sh
-# Restore everything the fix changed.
+# Removing the fix (1.1.2 / 1.2.1+) undoes only the voipgate.com exception and the old web report copy.
+# The KSK-2024 root key it added stays: it is the real DNS root key, and putting back the old KSK-2017-only
+# files would bring the DNS outage back.
 set +e
 B=/var/lib/jv-ksk2024-fix/backup
 case "$1" in remove|purge)
-  [ -f "$B/.files" ] && sort -u "$B/.files" | while read -r f; do [ -e "$B$f" ] && cp -a "$B$f" "$f"; done
-  [ -f "$B/.created" ] && sort -u "$B/.created" | while read -r f; do rm -f "$f"; done
+  [ -f "$B/.created" ] && sort -u "$B/.created" | grep -E 'jv-broken-dnssec\.negative$|jv-ksk2024-fix\.txt$' | while read -r f; do rm -f "$f"; done
   for s in unbound dnsmasq systemd-resolved; do systemctl is-active -q "$s" 2>/dev/null && systemctl restart "$s"; done
   rm -rf /var/lib/jv-ksk2024-fix
-  echo "$(date -u +%FT%TZ) jv-ksk2024-fix removed; originals restored" >> /var/log/jv-ksk2024-fix.log
+  echo "$(date -u +%FT%TZ) jv-ksk2024-fix removed; KSK-2024 root key kept" >> /var/log/jv-ksk2024-fix.log
 ;; esac
 exit 0

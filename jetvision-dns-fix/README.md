@@ -8,17 +8,22 @@ On 11 Oct 2026 the DNS root key changed from KSK-2017 (tag 20326) to KSK-2024 (t
 Sensors whose local validating resolver only trusts the old key fail every name lookup
 (MLAT "Host not found", no 4DSKY heartbeats).
 
-`jv-ksk2024-fix_1.1.1_all.deb` adds KSK-2024 (keeping KSK-2017) to whichever local resolver
+`jv-ksk2024-fix_1.1.2_all.deb` adds KSK-2024 (keeping KSK-2017) to whichever local resolver
 the sensor uses (dns-root-data, unbound, dnsmasq, systemd-resolved), restarts it, and writes a
 report to `/var/log/jv-ksk2024-fix.log`, and prints whether lookups work at the end of the install output.
 It also adds a negative trust anchor for `voipgate.com`, whose DNSSEC is broken upstream (a DS record
 but an unsigned zone): the 4DSKY/Neuron SDK hard-codes `stun.voipgate.com` and crashes at startup
 (`panic: lookup stun.voipgate.com ... server misbehaving`) when it can't resolve it. DNSSEC stays on
 for everything else. It then restarts the 4DSKY program (`neuron-sdk`), which stops retrying after
-many crashes. Removing the package restores the original files.
+many crashes. Removing the package (1.1.2+) takes out only the voipgate.com exception and keeps
+KSK-2024, since putting back the KSK-2017-only files would bring the outage back.
 
-`jv-ksk2024-fix_1.2.0_all.deb` (source in `pkg-cleanup/`) is the same but removes the voipgate.com
+`jv-ksk2024-fix_1.2.1_all.deb` (source in `pkg-cleanup/`) is the same but removes the voipgate.com
 exception; Sensor Keeper installs it once voipgate.com's DNS security works again.
+
+1.1.2 and 1.2.1 (Oct 25, 2026) keep the full report in `/var/log` only. Earlier versions also copied it to the
+sensor's web server (it lists processes and network details); the new versions delete that copy.
+1.1.1 and 1.2.0 stay here for reference.
 
 Confirmed on a real Air!Squitter on 12 Oct 2026: MLAT reconnected and 4DSKY heartbeats resumed.
 

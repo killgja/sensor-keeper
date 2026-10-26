@@ -6,7 +6,7 @@ from inside its own installation. Its first steps (new DNS root key, archive.deb
 apply; the rest does not.
 
 This package applies the **same changes** without that problem:
-- KSK-2024 DNSSEC trust anchor (if not already present)
+- KSK-2024 DNSSEC trust anchor (if not already present; 1.0.1 adds it next to the existing key and keeps a backup, `root.positive.jv-backup`)
 - `deb.debian.org` → `archive.debian.org` for buster in `/etc/apt/sources.list`
 - `/etc/systemd/resolved.conf`: `FallbackDNS=1.1.1.1 1.0.0.1 8.8.8.8`, `DNSSEC=allow-downgrade`, `DNSOverTLS=opportunistic`
 - `/etc/fixtime.conf` paths
